@@ -1,0 +1,252 @@
+"""Tests for MemoryExtension — tools, slash commands, prompt injection."""
+
+import json
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, PropertyMock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+TAU_ROOT = ROOT.parent / "tau"
+sys.path.insert(0, str(TAU_ROOT))
+
+import importlib.util
+
+_mod_name = "_tau_ext_memory_ext"
+_spec = importlib.util.spec_from_file_location(
+    _mod_name,
+    str(ROOT / "extensions" / "memory" / "extension.py"),
+)
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules[_mod_name] = _mod
+_spec.loader.exec_module(_mod)
+
+MemoryExtension = _mod.MemoryExtension
+MemoryStore = _mod.MemoryStore
+MEMORY_TYPES = _mod.MEMORY_TYPES
+_build_memory_prompt = _mod._build_memory_prompt
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def ext_with_store(tmp_path):
+    """Extension with a real MemoryStore on a tmp workspace."""
+    e = MemoryExtension()
+    ctx = MagicMock()
+    ctx.print = MagicMock()
+    ctx.enqueue = MagicMock()
+    ctx.inject_prompt_fragment = MagicMock()
+    e._ext_context = ctx
+    e._store = MemoryStore(str(tmp_path))
+    return e, ctx, tmp_path
+
+
+@pytest.fixture
+def ctx_mock():
+    ctx = MagicMock()
+    ctx.print = MagicMock()
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+class TestManifest:
+    def test_name(self):
+        assert MemoryExtension.manifest.name == "memory"
+
+    def test_version(self):
+        assert MemoryExtension.manifest.version == "0.1.0"
+
+
+# ---------------------------------------------------------------------------
+# Tools registration
+# ---------------------------------------------------------------------------
+
+class TestToolsRegistration:
+    def test_registers_two_tools(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        tools = ext.tools()
+        assert len(tools) == 2
+
+    def test_tool_names(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        names = {t.name for t in ext.tools()}
+        assert names == {"memory_save", "memory_read"}
+
+    def test_memory_save_params(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        save_tool = next(t for t in ext.tools() if t.name == "memory_save")
+        assert "title" in save_tool.parameters
+        assert "content" in save_tool.parameters
+        assert "memory_type" in save_tool.parameters
+
+    def test_memory_read_params(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        read_tool = next(t for t in ext.tools() if t.name == "memory_read")
+        assert "topic" in read_tool.parameters
+
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+
+class TestSlashCommands:
+    def test_registers_two_commands(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        cmds = ext.slash_commands()
+        assert len(cmds) == 2
+
+    def test_command_names(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        names = {c.name for c in ext.slash_commands()}
+        assert names == {"memory", "dream"}
+
+    def test_handle_memory(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        assert ext.handle_slash("memory", "", ctx_mock) is True
+
+    def test_handle_dream(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        assert ext.handle_slash("dream", "", ctx_mock) is True
+
+    def test_handle_unknown(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        assert ext.handle_slash("other", "", ctx_mock) is False
+
+
+# ---------------------------------------------------------------------------
+# memory_save handler
+# ---------------------------------------------------------------------------
+
+class TestMemorySaveHandler:
+    def test_save_success(self, ext_with_store):
+        ext, _, tmp_path = ext_with_store
+        result = ext._handle_memory_save(
+            title="User is a developer",
+            content="Senior Python developer, 10 years experience.",
+            memory_type="user",
+        )
+        assert "saved" in result.lower()
+        assert (tmp_path / ".tau" / "memory" / "user.md").is_file()
+
+    def test_save_invalid_type(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        result = ext._handle_memory_save(
+            title="Test", content="Data", memory_type="invalid"
+        )
+        assert "Error" in result
+        assert "invalid" in result.lower()
+
+    def test_save_all_types(self, ext_with_store):
+        ext, _, tmp_path = ext_with_store
+        for mtype in MEMORY_TYPES:
+            result = ext._handle_memory_save(
+                title=f"Test {mtype}", content="Content", memory_type=mtype
+            )
+            assert "saved" in result.lower()
+            assert (tmp_path / ".tau" / "memory" / f"{mtype}.md").is_file()
+
+    def test_save_no_store(self):
+        ext = MemoryExtension()
+        ext._store = None
+        result = ext._handle_memory_save("T", "C", "user")
+        assert "Error" in result
+
+
+# ---------------------------------------------------------------------------
+# memory_read handler
+# ---------------------------------------------------------------------------
+
+class TestMemoryReadHandler:
+    def test_read_list_empty(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        result = ext._handle_memory_read(topic="list")
+        assert "No memory files" in result
+
+    def test_read_list_with_data(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("Test", "Data", "user")
+        result = ext._handle_memory_read(topic="list")
+        assert "user.md" in result
+        assert "MEMORY.md" in result
+
+    def test_read_index(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("My Entry", "Data", "project")
+        result = ext._handle_memory_read(topic="index")
+        assert "My Entry" in result
+
+    def test_read_index_empty(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        result = ext._handle_memory_read(topic="index")
+        assert "No memory index" in result
+
+    def test_read_topic(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("Preference", "Dark mode", "user")
+        result = ext._handle_memory_read(topic="user")
+        assert "Dark mode" in result
+
+    def test_read_nonexistent_topic(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        result = ext._handle_memory_read(topic="nonexistent")
+        assert "No memory file" in result
+
+    def test_read_no_store(self):
+        ext = MemoryExtension()
+        ext._store = None
+        result = ext._handle_memory_read(topic="list")
+        assert "Error" in result
+
+
+# ---------------------------------------------------------------------------
+# System prompt injection
+# ---------------------------------------------------------------------------
+
+class TestPromptInjection:
+    def test_build_memory_prompt_with_content(self):
+        prompt = _build_memory_prompt("- [Pref](user.md) — likes dark mode", "/mem")
+        assert "Persistent Memory" in prompt
+        assert "dark mode" in prompt
+        assert "/mem" in prompt
+
+    def test_build_memory_prompt_empty(self):
+        prompt = _build_memory_prompt("", "/mem")
+        assert "No memories saved yet" in prompt
+
+    def test_prompt_includes_type_descriptions(self):
+        prompt = _build_memory_prompt("", "/mem")
+        assert "user" in prompt
+        assert "feedback" in prompt
+        assert "project" in prompt
+        assert "reference" in prompt
+
+    def test_prompt_includes_exclusions(self):
+        prompt = _build_memory_prompt("", "/mem")
+        assert "NOT to save" in prompt or "What NOT" in prompt
+
+
+# ---------------------------------------------------------------------------
+# /memory status display
+# ---------------------------------------------------------------------------
+
+class TestMemoryStatus:
+    def test_status_no_memories(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        ext._show_memory_status(ctx_mock)
+        output = ctx_mock.print.call_args[0][0]
+        assert "No memories" in output
+
+    def test_status_with_memories(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("Test", "Data", "user")
+        ext._show_memory_status(ctx_mock)
+        output = ctx_mock.print.call_args[0][0]
+        assert "Memory Status" in output
+        assert "user.md" in output

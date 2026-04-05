@@ -1,0 +1,8 @@
+{
+  "name": "tau-memory",
+  "version": "0.1.0",
+  "description": "Persistent memory for tau — auto-saves learnings across sessions via MEMORY.md index and topic files.",
+  "author": "datctbk",
+  "extensions": ["extensions/memory"],
+  "skills": ["skills/memory"]
+}
