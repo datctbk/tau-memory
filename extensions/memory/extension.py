@@ -22,6 +22,7 @@ How it works:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import time
@@ -31,10 +32,13 @@ from typing import TYPE_CHECKING, Any
 
 from tau.core.extension import Extension, ExtensionContext
 from tau.core.types import (
+    ErrorEvent,
     ExtensionManifest,
     SlashCommand,
     ToolDefinition,
     ToolParameter,
+    ToolResultEvent,
+    TurnComplete,
 )
 
 if TYPE_CHECKING:
@@ -269,6 +273,9 @@ project context, or external references — save it using the `memory_save` tool
 - Debugging solutions (the fix is in the code)
 - Ephemeral task details
 
+### Strict Write Discipline
+**NEVER** save memory about an intended code change or shell command until AFTER you have received the tool result confirming that the action was completely successful. This prevents hallucinated states where you misremember broken logic as fixed.
+
 ### Current Memory Index
 {memory_content if memory_content else "(No memories saved yet.)"}
 """
@@ -289,6 +296,25 @@ class MemoryExtension(Extension):
     def __init__(self) -> None:
         self._ext_context: ExtensionContext | None = None
         self._store: MemoryStore | None = None
+        def _env_int(name: str, default: int, min_value: int = 0) -> int:
+            raw = os.getenv(name, str(default)).strip()
+            try:
+                val = int(raw)
+            except ValueError:
+                return default
+            return max(min_value, val)
+
+        self._auto_enabled = os.getenv("TAU_MEMORY_AUTO", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self._auto_min_turns = _env_int("TAU_MEMORY_AUTO_MIN_TURNS", 6, 1)
+        self._auto_min_tool_results = _env_int("TAU_MEMORY_AUTO_MIN_TOOL_RESULTS", 3, 0)
+        self._auto_cooldown_seconds = _env_int("TAU_MEMORY_AUTO_COOLDOWN_SECONDS", 60, 0)
+        self._auto_max_updates = _env_int("TAU_MEMORY_AUTO_MAX_UPDATES", 5, 1)
+        self._auto_recent_messages = _env_int("TAU_MEMORY_AUTO_RECENT_MESSAGES", 12, 4)
+        self._turns_since_auto = 0
+        self._tool_results_since_auto = 0
+        self._auto_updates_done = 0
+        self._last_auto_ts = 0.0
+        self._last_auto_digest: str | None = None
 
     def on_load(self, context: ExtensionContext) -> None:
         self._ext_context = context
@@ -324,6 +350,8 @@ class MemoryExtension(Extension):
                     "important facts about the user, their preferences, project context, "
                     "or external references. Memories persist across sessions.\n\n"
                     "Types: user, feedback, project, reference\n\n"
+                    "Strict Write Discipline: NEVER save memory about an intended code change "
+                    "or command until AFTER you have received the tool result confirming it succeeded.\n\n"
                     "Do NOT save: code patterns (derivable), git history, debugging solutions, "
                     "or ephemeral task details."
                 ),
@@ -489,28 +517,43 @@ class MemoryExtension(Extension):
         # Try to use create_sub_session if available (tau-agents installed)
         if self._ext_context is not None and hasattr(self._ext_context, "create_sub_session"):
             try:
-                context.print("[cyan]Starting memory dream via sub-agent...[/cyan]")
+                context.print("[cyan]Memory dream started in background...[/cyan]")
                 sub = self._ext_context.create_sub_session(
                     system_prompt=prompt,
                     max_turns=8,
                     session_name="dream-agent",
                 )
-                with sub:
-                    events = sub.prompt_sync(
-                        f"Consolidate the memory files in {self._store.root}. "
-                        f"Read the index and all topic files, merge duplicates, "
-                        f"remove stale entries, and update the index."
-                    )
-                # Collect result
-                from tau.core.types import TextDelta
-                text = "".join(
-                    e.text for e in events
-                    if isinstance(e, TextDelta) and not getattr(e, "is_thinking", False)
+                
+                # The task to run
+                task_content = (
+                    f"Consolidate the memory files in {self._store.root}. "
+                    f"Read the index and all topic files, merge duplicates, "
+                    f"remove stale entries, and update the index."
                 )
-                context.print(f"[green]Dream complete.[/green]\n{text[:500]}")
+
+                def _run_dream():
+                    try:
+                        with sub:
+                            events = sub.prompt_sync(task_content)
+                        # Collect result
+                        from tau.core.types import TextDelta
+                        text = "".join(
+                            e.text for e in events
+                            if isinstance(e, TextDelta) and not getattr(e, "is_thinking", False)
+                        )
+                        context.print(f"\n[green]Memory dream fully consolidated.[/green]\n{text[:500]}")
+                    except Exception as e:
+                        logger.warning("Dream sub-agent execution failed: %s", e)
+                        context.print(f"\n[red]Background memory dream failed:[/red] {e}")
+
+                import threading
+                t = threading.Thread(target=_run_dream, name="DreamAgentThread")
+                t.daemon = True
+                t.start()
                 return
+
             except Exception as e:
-                logger.warning("Dream via sub-agent failed (%s), showing prompt instead", e)
+                logger.warning("Dream via sub-agent failed to start (%s), showing prompt instead", e)
 
         # Fallback: just show the prompt for the user to paste
         context.print(
@@ -518,6 +561,104 @@ class MemoryExtension(Extension):
             "[dim]Paste the following as your next message to trigger consolidation:[/dim]\n\n"
             + prompt[:2000]
         )
+
+    # ------------------------------------------------------------------
+    # Auto memory (phase 1)
+    # ------------------------------------------------------------------
+
+    def event_hook(self, event: "Event") -> None:
+        if not self._auto_enabled or self._store is None:
+            return
+        if isinstance(event, ToolResultEvent):
+            self._tool_results_since_auto += 1
+            return
+        if isinstance(event, ErrorEvent):
+            return
+        if isinstance(event, TurnComplete):
+            self._turns_since_auto += 1
+            self._maybe_auto_update()
+
+    def _maybe_auto_update(self) -> None:
+        if self._auto_updates_done >= self._auto_max_updates:
+            return
+        if self._turns_since_auto < self._auto_min_turns and self._tool_results_since_auto < self._auto_min_tool_results:
+            return
+        now = time.time()
+        if now - self._last_auto_ts < self._auto_cooldown_seconds:
+            return
+        candidate = self._build_auto_memory_candidate()
+        if candidate is None:
+            return
+        title, content = candidate
+        digest = hashlib.sha1((title + "\n" + content).encode("utf-8")).hexdigest()
+        if digest == self._last_auto_digest:
+            return
+        try:
+            self._store.save_memory(
+                title=title,
+                content=content,
+                memory_type="project",
+                topic="session",
+            )
+            self._last_auto_digest = digest
+            self._last_auto_ts = now
+            self._auto_updates_done += 1
+            self._turns_since_auto = 0
+            self._tool_results_since_auto = 0
+            if self._ext_context is not None:
+                self._ext_context.print("[dim]Auto memory updated.[/dim]")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Auto memory update failed: %s", exc)
+
+    def _build_auto_memory_candidate(self) -> tuple[str, str] | None:
+        if self._ext_context is None:
+            return None
+        ctx = getattr(self._ext_context, "_context", None)
+        if ctx is None or not hasattr(ctx, "get_messages"):
+            return None
+        try:
+            messages = ctx.get_messages()
+        except Exception:  # noqa: BLE001
+            return None
+
+        relevant = [m for m in messages if getattr(m, "role", None) in ("user", "assistant")]
+        if len(relevant) < 4:
+            return None
+        recent = relevant[-self._auto_recent_messages :]
+
+        user_lines: list[str] = []
+        assistant_lines: list[str] = []
+        for m in recent:
+            text = (getattr(m, "content", "") or "").strip().replace("\n", " ")
+            if not text:
+                continue
+            text = " ".join(text.split())
+            preview = text[:160] + ("..." if len(text) > 160 else "")
+            if m.role == "user":
+                user_lines.append(preview)
+            elif m.role == "assistant":
+                assistant_lines.append(preview)
+
+        if not user_lines and not assistant_lines:
+            return None
+
+        # Keep concise summaries to avoid noisy auto-memory spam.
+        user_part = "\n".join(f"- {u}" for u in user_lines[-3:])
+        assistant_part = "\n".join(f"- {a}" for a in assistant_lines[-2:])
+        lines = [
+            "Auto session snapshot:",
+            "Recent user intents:",
+            user_part or "- (none)",
+            "Recent assistant outcomes:",
+            assistant_part or "- (none)",
+        ]
+        content = "\n".join(lines).strip()
+        if len(content) < 40:
+            return None
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        title = f"Session update {ts}"
+        return (title, content)
 
 
 # Module-level instance

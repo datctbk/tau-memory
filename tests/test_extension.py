@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -26,6 +26,8 @@ MemoryExtension = _mod.MemoryExtension
 MemoryStore = _mod.MemoryStore
 MEMORY_TYPES = _mod.MEMORY_TYPES
 _build_memory_prompt = _mod._build_memory_prompt
+
+from tau.core.types import Message, TokenUsage, ToolResult, ToolResultEvent, TurnComplete
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +233,37 @@ class TestPromptInjection:
         prompt = _build_memory_prompt("", "/mem")
         assert "NOT to save" in prompt or "What NOT" in prompt
 
+    def test_prompt_includes_strict_discipline(self):
+        prompt = _build_memory_prompt("", "/mem")
+        assert "Strict Write Discipline" in prompt
+        assert "hallucinated" in prompt
+
 
 # ---------------------------------------------------------------------------
 # /memory status display
 # ---------------------------------------------------------------------------
 
 class TestMemoryStatus:
+    @patch("threading.Thread")
+    def test_dream_trigger(self, mock_thread, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        ext._store = MagicMock()
+        ext._store.get_dream_prompt.return_value = "merge stuff"
+        mock_sub = MagicMock()
+        mock_sub.__enter__ = MagicMock(return_value=mock_sub)
+        mock_sub.__exit__ = MagicMock(return_value=False)
+        from tau.core.types import TextDelta
+        mock_sub.prompt_sync.return_value = [TextDelta(text="done dreaming")]
+        ext._ext_context.create_sub_session.return_value = mock_sub
+
+        ext.handle_slash("dream", "", ctx_mock)
+        ext._ext_context.create_sub_session.assert_called_once()
+        mock_thread.assert_called_once()
+        mock_thread.return_value.start.assert_called_once()
+        
+        args, kwargs = ctx_mock.print.call_args_list[0]
+        assert "background" in args[0].lower()
+
     def test_status_no_memories(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store
         ext._show_memory_status(ctx_mock)
@@ -250,3 +277,75 @@ class TestMemoryStatus:
         output = ctx_mock.print.call_args[0][0]
         assert "Memory Status" in output
         assert "user.md" in output
+
+
+class _DummyContextManager:
+    def __init__(self, messages):
+        self._messages = messages
+
+    def get_messages(self):
+        return list(self._messages)
+
+
+class TestAutoMemoryPhase1:
+    def test_auto_memory_triggers_on_turn_complete(self, ext_with_store, tmp_path):
+        ext, ctx, _ = ext_with_store
+        ext._auto_enabled = True
+        ext._auto_min_turns = 1
+        ext._auto_min_tool_results = 0
+        ext._auto_cooldown_seconds = 0
+        ext._auto_max_updates = 5
+
+        ctx._context = _DummyContextManager([
+            Message(role="user", content="Please implement task event stream API."),
+            Message(role="assistant", content="I will add structured events and tools."),
+            Message(role="user", content="Also add tests and validate."),
+            Message(role="assistant", content="Done with tests and validation."),
+        ])
+
+        ext.event_hook(TurnComplete(usage=TokenUsage()))
+
+        session_file = tmp_path / ".tau" / "memory" / "session.md"
+        assert session_file.is_file()
+        content = session_file.read_text(encoding="utf-8")
+        assert "Auto session snapshot" in content
+
+    def test_auto_memory_disabled(self, ext_with_store, tmp_path):
+        ext, ctx, _ = ext_with_store
+        ext._auto_enabled = False
+        ext._auto_min_turns = 1
+        ext._auto_cooldown_seconds = 0
+
+        ctx._context = _DummyContextManager([
+            Message(role="user", content="A" * 80),
+            Message(role="assistant", content="B" * 80),
+            Message(role="user", content="C" * 80),
+            Message(role="assistant", content="D" * 80),
+        ])
+
+        ext.event_hook(TurnComplete(usage=TokenUsage()))
+        assert not (tmp_path / ".tau" / "memory" / "session.md").exists()
+
+    def test_auto_memory_respects_cooldown(self, ext_with_store, tmp_path):
+        ext, ctx, _ = ext_with_store
+        ext._auto_enabled = True
+        ext._auto_min_turns = 1
+        ext._auto_cooldown_seconds = 999999
+        ext._auto_max_updates = 5
+
+        ctx._context = _DummyContextManager([
+            Message(role="user", content="Need memory snapshot one."),
+            Message(role="assistant", content="Snapshot one done."),
+            Message(role="user", content="Need memory snapshot two."),
+            Message(role="assistant", content="Snapshot two done."),
+        ])
+
+        ext.event_hook(TurnComplete(usage=TokenUsage()))
+        ext.event_hook(ToolResultEvent(result=ToolResult(tool_call_id="x", content="ok")))
+        ext.event_hook(TurnComplete(usage=TokenUsage()))
+
+        session_file = tmp_path / ".tau" / "memory" / "session.md"
+        assert session_file.is_file()
+        content = session_file.read_text(encoding="utf-8")
+        # With huge cooldown, only one auto-update block should be appended.
+        assert content.count("Auto session snapshot") == 1
