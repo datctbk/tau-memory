@@ -25,6 +25,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ ENTRYPOINT_NAME = "MEMORY.md"
 MAX_ENTRYPOINT_LINES = 200
 MAX_ENTRYPOINT_BYTES = 25_000
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
+GLOBAL_MEMORY_TYPES = {"user", "feedback"}
 
 
 # ---------------------------------------------------------------------------
@@ -69,56 +71,82 @@ class MemoryStore:
         <workspace>/.tau/memory/<topic>.md
     """
 
-    def __init__(self, workspace: str) -> None:
+    def __init__(self, workspace: str, global_root: str | None = None) -> None:
         self._root = Path(workspace) / ".tau" / "memory"
+        if global_root is None:
+            global_root = os.getenv("TAU_MEMORY_GLOBAL_DIR", "~/.tau/memory")
+        self._global_root = Path(global_root).expanduser()
 
     @property
     def root(self) -> Path:
         return self._root
 
     @property
+    def global_root(self) -> Path:
+        return self._global_root
+
+    @property
     def entrypoint(self) -> Path:
         return self._root / ENTRYPOINT_NAME
+
+    @property
+    def global_entrypoint(self) -> Path:
+        return self._global_root / ENTRYPOINT_NAME
+
+    def _scope_root(self, scope: str) -> Path:
+        return self._global_root if scope == "global" else self._root
+
+    def _scope_for_memory_type(self, memory_type: str) -> str:
+        return "global" if memory_type in GLOBAL_MEMORY_TYPES else "local"
+
+    def _scope_for_topic(self, topic: str) -> str:
+        return "global" if topic in GLOBAL_MEMORY_TYPES else "local"
 
     def ensure_dir(self) -> None:
         """Create memory directory if it doesn't exist."""
         self._root.mkdir(parents=True, exist_ok=True)
+        self._global_root.mkdir(parents=True, exist_ok=True)
 
-    def exists(self) -> bool:
-        return self.entrypoint.is_file()
+    def exists(self, scope: str = "local") -> bool:
+        path = self.global_entrypoint if scope == "global" else self.entrypoint
+        return path.is_file()
 
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
-    def read_entrypoint(self) -> str:
+    def read_entrypoint(self, scope: str = "local") -> str:
         """Read MEMORY.md, truncating if too large."""
-        if not self.entrypoint.is_file():
+        path = self.global_entrypoint if scope == "global" else self.entrypoint
+        if not path.is_file():
             return ""
-        raw = self.entrypoint.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
         return self._truncate(raw)
 
-    def read_topic(self, name: str) -> str:
+    def read_topic(self, name: str, scope: str | None = None) -> str:
         """Read a specific topic file."""
-        topic_file = self._root / f"{name}.md"
+        resolved_scope = scope or self._scope_for_topic(name)
+        topic_file = self._scope_root(resolved_scope) / f"{name}.md"
         if not topic_file.is_file():
             return ""
         return topic_file.read_text(encoding="utf-8")
 
     def list_topics(self) -> list[dict[str, Any]]:
         """List all memory files with metadata."""
-        if not self._root.is_dir():
-            return []
         entries = []
-        for f in sorted(self._root.glob("*.md")):
-            stat = f.stat()
-            entries.append({
-                "name": f.stem,
-                "file": f.name,
-                "size_bytes": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                "lines": f.read_text(encoding="utf-8").count("\n") + 1,
-            })
+        for scope, root in (("local", self._root), ("global", self._global_root)):
+            if not root.is_dir():
+                continue
+            for f in sorted(root.glob("*.md")):
+                stat = f.stat()
+                entries.append({
+                    "scope": scope,
+                    "name": f.stem,
+                    "file": f.name,
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    "lines": f.read_text(encoding="utf-8").count("\n") + 1,
+                })
         return entries
 
     # ------------------------------------------------------------------
@@ -131,6 +159,7 @@ class MemoryStore:
         content: str,
         memory_type: str = "project",
         topic: str | None = None,
+        scope: str | None = None,
     ) -> str:
         """Save a memory entry to the appropriate topic file and update the index.
 
@@ -141,7 +170,8 @@ class MemoryStore:
         # Determine topic file
         if topic is None:
             topic = memory_type if memory_type in MEMORY_TYPES else "project"
-        topic_file = self._root / f"{topic}.md"
+        resolved_scope = scope or self._scope_for_memory_type(memory_type)
+        topic_file = self._scope_root(resolved_scope) / f"{topic}.md"
 
         # Build frontmatter entry
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -156,27 +186,28 @@ class MemoryStore:
             topic_file.write_text(header + entry, encoding="utf-8")
 
         # Update index
-        self._update_index(title, f"{topic}.md", memory_type)
+        self._update_index(title, f"{topic}.md", memory_type, resolved_scope)
 
         return str(topic_file)
 
-    def _update_index(self, title: str, filename: str, memory_type: str) -> None:
+    def _update_index(self, title: str, filename: str, memory_type: str, scope: str) -> None:
         """Add or update an entry in MEMORY.md."""
         index_line = f"- [{title}]({filename}) — {memory_type}\n"
+        entrypoint = self.global_entrypoint if scope == "global" else self.entrypoint
 
-        if self.entrypoint.is_file():
-            existing = self.entrypoint.read_text(encoding="utf-8")
+        if entrypoint.is_file():
+            existing = entrypoint.read_text(encoding="utf-8")
             # Check for duplicate
             if title in existing:
                 return  # already indexed
-            self.entrypoint.write_text(existing + index_line, encoding="utf-8")
+            entrypoint.write_text(existing + index_line, encoding="utf-8")
         else:
             header = (
                 f"# Memory Index\n\n"
                 f"*Auto-maintained by tau-memory. Do not edit manually.*\n"
                 f"*Each entry is one line — detail lives in topic files.*\n\n"
             )
-            self.entrypoint.write_text(header + index_line, encoding="utf-8")
+            entrypoint.write_text(header + index_line, encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Truncation
@@ -281,6 +312,21 @@ project context, or external references — save it using the `memory_save` tool
 """
 
 
+def _build_scoped_memory_prompt(
+    local_index: str,
+    local_root: str,
+    global_index: str,
+    global_root: str,
+) -> str:
+    combined = (
+        "### Workspace Memory Index\n"
+        + (local_index if local_index else "(No workspace memories saved yet.)")
+        + "\n\n### Global Memory Index\n"
+        + (global_index if global_index else "(No global memories saved yet.)")
+    )
+    return _build_memory_prompt(combined, f"local={local_root}, global={global_root}")
+
+
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
@@ -315,6 +361,23 @@ class MemoryExtension(Extension):
         self._auto_updates_done = 0
         self._last_auto_ts = 0.0
         self._last_auto_digest: str | None = None
+        self._topk = 0
+        self._retrieval_token_budget = 420
+
+    _RETRIEVAL_START = "<!-- TAU_MEMORY_RETRIEVAL_START -->"
+    _RETRIEVAL_END = "<!-- TAU_MEMORY_RETRIEVAL_END -->"
+
+    @staticmethod
+    def _inject_fragment(context: ExtensionContext, fragment: str) -> None:
+        """Inject prompt fragment across ExtensionContext API variants."""
+        if hasattr(context, "inject_prompt_fragment"):
+            context.inject_prompt_fragment(fragment)  # type: ignore[attr-defined]
+            return
+        inner = getattr(context, "_context", None)
+        if inner is not None and hasattr(inner, "inject_prompt_fragment"):
+            inner.inject_prompt_fragment(fragment)
+            return
+        raise AttributeError("No inject_prompt_fragment API available on ExtensionContext")
 
     def on_load(self, context: ExtensionContext) -> None:
         self._ext_context = context
@@ -325,17 +388,126 @@ class MemoryExtension(Extension):
             workspace = getattr(context._agent_config, "workspace_root", ".") or "."
 
         self._store = MemoryStore(workspace)
+        agent_cfg = getattr(context, "_agent_config", None)
+        self._topk = max(0, int(getattr(agent_cfg, "memory_topk", 0) or 0))
+        self._retrieval_token_budget = max(
+            300,
+            min(500, int(os.getenv("TAU_MEMORY_RETRIEVAL_MAX_TOKENS", "420"))),
+        )
 
-        # Inject memory into system prompt if it exists
-        if self._store.exists():
-            content = self._store.read_entrypoint()
-            fragment = _build_memory_prompt(content, str(self._store.root))
-            context.inject_prompt_fragment(fragment)
-            logger.debug("Memory: injected %d chars from %s", len(content), self._store.entrypoint)
+        if self._topk > 0:
+            fragment = _build_memory_prompt(
+                "Top-k retrieval is enabled for memory. Use retrieved memory block below when present.",
+                f"local={self._store.root}, global={self._store.global_root}",
+            )
         else:
-            # Inject minimal prompt so agent knows memory is available
-            fragment = _build_memory_prompt("", str(self._store.root))
-            context.inject_prompt_fragment(fragment)
+            local_index = self._store.read_entrypoint(scope="local")
+            global_index = self._store.read_entrypoint(scope="global")
+            fragment = _build_scoped_memory_prompt(
+                local_index=local_index,
+                local_root=str(self._store.root),
+                global_index=global_index,
+                global_root=str(self._store.global_root),
+            )
+        self._inject_fragment(context, fragment)
+        logger.debug("Memory: topk=%d, retrieval_budget=%d", self._topk, self._retrieval_token_budget)
+
+    def before_turn(self, user_input: str) -> None:
+        if self._store is None or self._topk <= 0:
+            return
+        block = self._build_retrieval_block(user_input, topk=self._topk)
+        self._upsert_retrieval_fragment(block)
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _tokenize_query(text: str) -> set[str]:
+        return {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())}
+
+    def _collect_memory_entries(self) -> list[tuple[str, str, str]]:
+        """Return [(scope, title, body)] from topic files (excluding MEMORY index)."""
+        if self._store is None:
+            return []
+        entries: list[tuple[str, str, str]] = []
+        for scope, root in (("local", self._store.root), ("global", self._store.global_root)):
+            if not root.is_dir():
+                continue
+            for f in sorted(root.glob("*.md")):
+                if f.name == ENTRYPOINT_NAME:
+                    continue
+                text = f.read_text(encoding="utf-8")
+                chunks = re.split(r"\n##\s+", text)
+                for i, ch in enumerate(chunks):
+                    chunk = ch.strip()
+                    if not chunk:
+                        continue
+                    if i == 0 and chunk.startswith("#"):
+                        # file header section
+                        continue
+                    first_line = chunk.splitlines()[0].strip()
+                    title = first_line if first_line else f.stem
+                    body = chunk[:500].strip()
+                    entries.append((scope, title, body))
+        return entries
+
+    def _build_retrieval_block(self, query: str, topk: int) -> str:
+        q = self._tokenize_query(query)
+        if not q:
+            return ""
+        scored: list[tuple[int, str]] = []
+        for scope, title, body in self._collect_memory_entries():
+            hay = f"{title}\n{body}".lower()
+            score = sum(1 for token in q if token in hay)
+            if score <= 0:
+                continue
+            scored.append((score, f"- ({scope}) {title}: {body}"))
+        if not scored:
+            return ""
+        scored.sort(key=lambda x: x[0], reverse=True)
+        selected: list[str] = []
+        budget = self._retrieval_token_budget
+        used = self._estimate_tokens("Relevant memory for this turn:\n")
+        for _, line in scored[: max(1, topk * 4)]:
+            cost = self._estimate_tokens(line)
+            if len(selected) >= topk:
+                break
+            if used + cost > budget:
+                continue
+            selected.append(line)
+            used += cost
+        if not selected:
+            return ""
+        return "Relevant memory for this turn:\n" + "\n".join(selected)
+
+    def _upsert_retrieval_fragment(self, block: str) -> None:
+        if self._ext_context is None:
+            return
+        inner = getattr(self._ext_context, "_context", None)
+        if inner is None:
+            return
+        messages = getattr(inner, "_messages", None)
+        if not isinstance(messages, list):
+            return
+        fragment = (
+            f"{self._RETRIEVAL_START}\n{block}\n{self._RETRIEVAL_END}"
+            if block
+            else ""
+        )
+        pattern = re.compile(
+            re.escape(self._RETRIEVAL_START) + r".*?" + re.escape(self._RETRIEVAL_END),
+            re.S,
+        )
+        for m in messages:
+            if getattr(m, "role", None) != "system":
+                continue
+            content = getattr(m, "content", "") or ""
+            content = pattern.sub("", content).rstrip()
+            if fragment:
+                content = f"{content}\n\n{fragment}".strip()
+            m.content = content
+            break
 
     # ------------------------------------------------------------------
     # Tools
@@ -462,14 +634,20 @@ class MemoryExtension(Extension):
             topics = self._store.list_topics()
             if not topics:
                 return "No memory files found."
-            lines = ["| File | Lines | Size | Modified |", "|------|-------|------|----------|"]
+            lines = ["| Scope | File | Lines | Size | Modified |", "|-------|------|-------|------|----------|"]
             for t in topics:
-                lines.append(f"| {t['file']} | {t['lines']} | {t['size_bytes']}B | {t['modified'][:10]} |")
+                lines.append(f"| {t['scope']} | {t['file']} | {t['lines']} | {t['size_bytes']}B | {t['modified'][:10]} |")
             return "\n".join(lines)
 
         if topic == "index":
-            content = self._store.read_entrypoint()
-            return content if content else "(No memory index found.)"
+            local_index = self._store.read_entrypoint(scope="local")
+            global_index = self._store.read_entrypoint(scope="global")
+            return (
+                "# Workspace Memory Index\n\n"
+                + (local_index if local_index else "(No workspace memory index found.)")
+                + "\n\n# Global Memory Index\n\n"
+                + (global_index if global_index else "(No global memory index found.)")
+            )
 
         content = self._store.read_topic(topic)
         if not content:
@@ -492,14 +670,15 @@ class MemoryExtension(Extension):
 
         lines = [
             "[bold cyan]Memory Status[/bold cyan]",
-            f"[dim]Root: {self._store.root}[/dim]",
+            f"[dim]Workspace root: {self._store.root}[/dim]",
+            f"[dim]Global root: {self._store.global_root}[/dim]",
             "",
         ]
         total_bytes = 0
         total_lines = 0
         for t in topics:
             icon = "📋" if t["name"] == "MEMORY" else "📝"
-            lines.append(f"  {icon} [bold]{t['file']}[/bold] — {t['lines']} lines, {t['size_bytes']}B")
+            lines.append(f"  {icon} [bold]{t['file']}[/bold] ({t['scope']}) — {t['lines']} lines, {t['size_bytes']}B")
             total_bytes += t["size_bytes"]
             total_lines += t["lines"]
 

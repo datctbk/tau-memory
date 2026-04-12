@@ -25,6 +25,7 @@ _spec.loader.exec_module(_mod)
 MemoryExtension = _mod.MemoryExtension
 MemoryStore = _mod.MemoryStore
 MEMORY_TYPES = _mod.MEMORY_TYPES
+GLOBAL_MEMORY_TYPES = _mod.GLOBAL_MEMORY_TYPES
 _build_memory_prompt = _mod._build_memory_prompt
 
 from tau.core.types import Message, TokenUsage, ToolResult, ToolResultEvent, TurnComplete
@@ -43,7 +44,7 @@ def ext_with_store(tmp_path):
     ctx.enqueue = MagicMock()
     ctx.inject_prompt_fragment = MagicMock()
     e._ext_context = ctx
-    e._store = MemoryStore(str(tmp_path))
+    e._store = MemoryStore(str(tmp_path), global_root=str(tmp_path / ".tau" / "memory-global"))
     return e, ctx, tmp_path
 
 
@@ -135,7 +136,7 @@ class TestMemorySaveHandler:
             memory_type="user",
         )
         assert "saved" in result.lower()
-        assert (tmp_path / ".tau" / "memory" / "user.md").is_file()
+        assert (tmp_path / ".tau" / "memory-global" / "user.md").is_file()
 
     def test_save_invalid_type(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -152,7 +153,10 @@ class TestMemorySaveHandler:
                 title=f"Test {mtype}", content="Content", memory_type=mtype
             )
             assert "saved" in result.lower()
-            assert (tmp_path / ".tau" / "memory" / f"{mtype}.md").is_file()
+            if mtype in GLOBAL_MEMORY_TYPES:
+                assert (tmp_path / ".tau" / "memory-global" / f"{mtype}.md").is_file()
+            else:
+                assert (tmp_path / ".tau" / "memory" / f"{mtype}.md").is_file()
 
     def test_save_no_store(self):
         ext = MemoryExtension()
@@ -177,6 +181,7 @@ class TestMemoryReadHandler:
         result = ext._handle_memory_read(topic="list")
         assert "user.md" in result
         assert "MEMORY.md" in result
+        assert "global" in result
 
     def test_read_index(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -187,7 +192,7 @@ class TestMemoryReadHandler:
     def test_read_index_empty(self, ext_with_store):
         ext, _, _ = ext_with_store
         result = ext._handle_memory_read(topic="index")
-        assert "No memory index" in result
+        assert "No workspace memory index" in result
 
     def test_read_topic(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -277,6 +282,7 @@ class TestMemoryStatus:
         output = ctx_mock.print.call_args[0][0]
         assert "Memory Status" in output
         assert "user.md" in output
+        assert "global" in output.lower()
 
 
 class _DummyContextManager:
@@ -349,3 +355,54 @@ class TestAutoMemoryPhase1:
         content = session_file.read_text(encoding="utf-8")
         # With huge cooldown, only one auto-update block should be appended.
         assert content.count("Auto session snapshot") == 1
+
+
+class TestTopKRetrieval:
+    def test_before_turn_injects_retrieval_when_topk_enabled(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 2
+
+        ext.on_load(ctx)
+        ext._handle_memory_save("Prefs", "User prefers concise output and practical examples.", "user")
+        ext._handle_memory_save("Project", "Working on scheduler fairness and event streams.", "project")
+
+        ext.before_turn("Please keep output concise for scheduler fairness task")
+
+        sys_msg = ctx._context._messages[0].content
+        assert "TAU_MEMORY_RETRIEVAL_START" in sys_msg
+        assert "Relevant memory for this turn" in sys_msg
+
+    def test_before_turn_skips_retrieval_when_topk_disabled(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 0
+
+        ext.on_load(ctx)
+        ext._handle_memory_save("Prefs", "User prefers concise output and practical examples.", "user")
+
+        ext.before_turn("please be concise")
+        sys_msg = ctx._context._messages[0].content
+        assert "TAU_MEMORY_RETRIEVAL_START" not in sys_msg
