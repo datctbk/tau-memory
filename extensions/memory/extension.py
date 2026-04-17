@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import time
+from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -160,6 +161,9 @@ class MemoryStore:
         memory_type: str = "project",
         topic: str | None = None,
         scope: str | None = None,
+        confidence: float | None = None,
+        source: str | None = None,
+        explicitness: str = "explicit",
     ) -> str:
         """Save a memory entry to the appropriate topic file and update the index.
 
@@ -173,9 +177,37 @@ class MemoryStore:
         resolved_scope = scope or self._scope_for_memory_type(memory_type)
         topic_file = self._scope_root(resolved_scope) / f"{topic}.md"
 
-        # Build frontmatter entry
+        # Normalize optional metadata
+        confidence_str = ""
+        if confidence is not None:
+            try:
+                confidence = max(0.0, min(1.0, float(confidence)))
+                confidence_str = f" | confidence: {confidence:.2f}"
+            except Exception:  # noqa: BLE001
+                confidence_str = ""
+
+        source_str = f" | source: {source.strip()}" if source and source.strip() else ""
+        exp = explicitness.strip().lower() if explicitness else "explicit"
+        if exp not in {"explicit", "inferred"}:
+            exp = "explicit"
+        explicitness_str = f" | explicitness: {exp}"
+
+        # Detect same-title conflict in target topic file.
+        conflict = False
+        previous_count = 0
+        if topic_file.is_file():
+            existing = topic_file.read_text(encoding="utf-8")
+            previous_count = len(re.findall(rf"^##\s+{re.escape(title)}\s*$", existing, flags=re.M))
+            conflict = previous_count > 0
+
+        # Build entry
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        entry = f"\n\n## {title}\n*type: {memory_type} | saved: {now}*\n\n{content.strip()}\n"
+        conflict_str = f" | conflict: supersedes-{previous_count}" if conflict else ""
+        entry = (
+            f"\n\n## {title}\n"
+            f"*type: {memory_type} | saved: {now}{explicitness_str}{confidence_str}{source_str}{conflict_str}*\n\n"
+            f"{content.strip()}\n"
+        )
 
         # Append to topic file
         if topic_file.is_file():
@@ -426,11 +458,11 @@ class MemoryExtension(Extension):
     def _tokenize_query(text: str) -> set[str]:
         return {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())}
 
-    def _collect_memory_entries(self) -> list[tuple[str, str, str]]:
-        """Return [(scope, title, body)] from topic files (excluding MEMORY index)."""
+    def _collect_memory_entries(self) -> list[tuple[str, str, str, int]]:
+        """Return [(scope, title, body, saved_ordinal)] from topic files (excluding MEMORY index)."""
         if self._store is None:
             return []
-        entries: list[tuple[str, str, str]] = []
+        entries: list[tuple[str, str, str, int]] = []
         for scope, root in (("local", self._store.root), ("global", self._store.global_root)):
             if not root.is_dir():
                 continue
@@ -449,18 +481,62 @@ class MemoryExtension(Extension):
                     first_line = chunk.splitlines()[0].strip()
                     title = first_line if first_line else f.stem
                     body = chunk[:500].strip()
-                    entries.append((scope, title, body))
+                    saved_ordinal = 0
+                    m = re.search(r"saved:\s*(\d{4}-\d{2}-\d{2})", chunk)
+                    if m:
+                        try:
+                            saved_ordinal = date.fromisoformat(m.group(1)).toordinal()
+                        except Exception:  # noqa: BLE001
+                            saved_ordinal = 0
+                    entries.append((scope, title, body, saved_ordinal))
         return entries
+
+    def _score_retrieval_entry(
+        self,
+        *,
+        query_tokens: set[str],
+        scope: str,
+        title: str,
+        body: str,
+        saved_ordinal: int,
+    ) -> float:
+        hay = f"{title}\n{body}".lower()
+        entry_tokens = self._tokenize_query(hay)
+        overlap = len(query_tokens & entry_tokens)
+        if overlap == 0:
+            return 0.0
+
+        coverage = overlap / max(1, len(query_tokens))
+        title_tokens = self._tokenize_query(title)
+        title_hit = len(query_tokens & title_tokens)
+
+        recency_boost = 0.0
+        if saved_ordinal > 0:
+            age_days = max(0, date.today().toordinal() - saved_ordinal)
+            if age_days <= 7:
+                recency_boost = 0.30
+            elif age_days <= 30:
+                recency_boost = 0.15
+
+        scope_boost = 0.10 if scope == "global" else 0.0
+
+        return overlap + coverage + (title_hit * 0.50) + recency_boost + scope_boost
 
     def _build_retrieval_block(self, query: str, topk: int) -> str:
         q = self._tokenize_query(query)
         if not q:
             return ""
-        scored: list[tuple[int, str]] = []
-        for scope, title, body in self._collect_memory_entries():
-            hay = f"{title}\n{body}".lower()
-            score = sum(1 for token in q if token in hay)
-            if score <= 0:
+        min_score = float(os.getenv("TAU_MEMORY_RETRIEVAL_MIN_SCORE", "1.2"))
+        scored: list[tuple[float, str]] = []
+        for scope, title, body, saved_ordinal in self._collect_memory_entries():
+            score = self._score_retrieval_entry(
+                query_tokens=q,
+                scope=scope,
+                title=title,
+                body=body,
+                saved_ordinal=saved_ordinal,
+            )
+            if score < min_score:
                 continue
             scored.append((score, f"- ({scope}) {title}: {body}"))
         if not scored:
@@ -548,6 +624,21 @@ class MemoryExtension(Extension):
                         description="Optional topic file name (defaults to memory_type). Use for custom groupings.",
                         required=False,
                     ),
+                    "confidence": ToolParameter(
+                        type="number",
+                        description="Optional confidence score in [0,1]. Higher means stronger confidence in this memory.",
+                        required=False,
+                    ),
+                    "source": ToolParameter(
+                        type="string",
+                        description="Optional source for the memory (e.g., user-explicit, tool-result, inference).",
+                        required=False,
+                    ),
+                    "explicitness": ToolParameter(
+                        type="string",
+                        description="Whether the fact is explicit or inferred. One of: explicit, inferred.",
+                        required=False,
+                    ),
                 },
                 handler=self._handle_memory_save,
             ),
@@ -608,6 +699,9 @@ class MemoryExtension(Extension):
         content: str,
         memory_type: str,
         topic: str | None = None,
+        confidence: float | None = None,
+        source: str | None = None,
+        explicitness: str = "explicit",
     ) -> str:
         if self._store is None:
             return "Error: Memory store not initialized."
@@ -621,6 +715,9 @@ class MemoryExtension(Extension):
                 content=content,
                 memory_type=memory_type,
                 topic=topic,
+                confidence=confidence,
+                source=source,
+                explicitness=explicitness,
             )
             return f"Memory saved: '{title}' → {path}"
         except Exception as e:

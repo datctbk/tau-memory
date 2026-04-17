@@ -166,6 +166,28 @@ class TestMemoryStoreSave:
         content = (store.global_root / "feedback.md").read_text(encoding="utf-8")
         assert "type: feedback" in content
 
+    def test_save_includes_confidence_and_explicitness(self, tmp_path):
+        store = MemoryStore(str(tmp_path), global_root=str(tmp_path / ".tau" / "memory-global"))
+        store.save_memory(
+            "Confident",
+            "User explicitly asked for concise answers.",
+            "user",
+            confidence=0.9,
+            explicitness="explicit",
+            source="user-explicit",
+        )
+        content = (store.global_root / "user.md").read_text(encoding="utf-8")
+        assert "confidence: 0.90" in content
+        assert "explicitness: explicit" in content
+        assert "source: user-explicit" in content
+
+    def test_save_marks_conflict_as_supersede(self, tmp_path):
+        store = MemoryStore(str(tmp_path), global_root=str(tmp_path / ".tau" / "memory-global"))
+        store.save_memory("Tone", "Prefer concise.", "user")
+        store.save_memory("Tone", "Prefer detailed.", "user")
+        content = (store.global_root / "user.md").read_text(encoding="utf-8")
+        assert "conflict: supersedes-1" in content
+
 
 # ---------------------------------------------------------------------------
 # Truncation

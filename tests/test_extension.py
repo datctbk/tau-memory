@@ -88,6 +88,9 @@ class TestToolsRegistration:
         assert "title" in save_tool.parameters
         assert "content" in save_tool.parameters
         assert "memory_type" in save_tool.parameters
+        assert "confidence" in save_tool.parameters
+        assert "source" in save_tool.parameters
+        assert "explicitness" in save_tool.parameters
 
     def test_memory_read_params(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -157,6 +160,21 @@ class TestMemorySaveHandler:
                 assert (tmp_path / ".tau" / "memory-global" / f"{mtype}.md").is_file()
             else:
                 assert (tmp_path / ".tau" / "memory" / f"{mtype}.md").is_file()
+
+    def test_save_with_confidence_metadata(self, ext_with_store):
+        ext, _, tmp_path = ext_with_store
+        result = ext._handle_memory_save(
+            title="Preference",
+            content="User explicitly requested concise responses.",
+            memory_type="user",
+            confidence=0.95,
+            source="user-explicit",
+            explicitness="explicit",
+        )
+        assert "saved" in result.lower()
+        text = (tmp_path / ".tau" / "memory-global" / "user.md").read_text(encoding="utf-8")
+        assert "confidence: 0.95" in text
+        assert "source: user-explicit" in text
 
     def test_save_no_store(self):
         ext = MemoryExtension()
@@ -406,3 +424,27 @@ class TestTopKRetrieval:
         ext.before_turn("please be concise")
         sys_msg = ctx._context._messages[0].content
         assert "TAU_MEMORY_RETRIEVAL_START" not in sys_msg
+
+    def test_retrieval_prefers_title_and_overlap_quality(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 1
+
+        ext.on_load(ctx)
+        ext._handle_memory_save("Scheduler Fairness", "Tune scheduler fairness window.", "project")
+        ext._handle_memory_save("Random", "Completely unrelated note content.", "project")
+
+        block = ext._build_retrieval_block("scheduler fairness", topk=1)
+        assert "Scheduler Fairness" in block
+        assert "Random" not in block
