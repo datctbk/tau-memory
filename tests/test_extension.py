@@ -448,3 +448,67 @@ class TestTopKRetrieval:
         block = ext._build_retrieval_block("scheduler fairness", topk=1)
         assert "Scheduler Fairness" in block
         assert "Random" not in block
+
+    def test_retrieval_includes_explainability_reason(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 1
+
+        ext.on_load(ctx)
+        ext._handle_memory_save(
+            "Comms Style",
+            "User prefers concise updates and practical examples.",
+            "user",
+            confidence=0.9,
+            source="user-explicit",
+            explicitness="explicit",
+        )
+
+        block = ext._build_retrieval_block("concise practical examples", topk=1)
+        assert "why: overlap=" in block
+        assert "eff_conf=" in block
+        assert "conflict_penalty=" in block
+        assert "score=" in block
+
+    def test_retrieval_cache_uses_cached_block_and_invalidates_on_file_change(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 2
+
+        ext.on_load(ctx)
+        ext._handle_memory_save("Prefs", "User likes concise updates.", "user")
+
+        block1 = ext._build_retrieval_block("concise updates", topk=1)
+        assert "Prefs" in block1
+
+        # Same query + unchanged files should hit block cache (no recollect needed).
+        with patch.object(ext, "_collect_memory_entries", side_effect=AssertionError("should not recollect")):
+            block2 = ext._build_retrieval_block("concise updates", topk=1)
+            assert block2 == block1
+
+        # File change should invalidate cache and recollect fresh entries.
+        ext._handle_memory_save("New Prefs", "User now wants detailed design notes.", "user")
+        block3 = ext._build_retrieval_block("detailed design notes", topk=1)
+        assert "New Prefs" in block3

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import re
 import time
@@ -395,6 +396,9 @@ class MemoryExtension(Extension):
         self._last_auto_digest: str | None = None
         self._topk = 0
         self._retrieval_token_budget = 420
+        self._entries_cache_key: tuple[tuple[str, int, int], ...] = ()
+        self._entries_cache_rows: list[dict[str, Any]] = []
+        self._block_cache: dict[tuple[str, int, tuple[tuple[str, int, int], ...]], str] = {}
 
     _RETRIEVAL_START = "<!-- TAU_MEMORY_RETRIEVAL_START -->"
     _RETRIEVAL_END = "<!-- TAU_MEMORY_RETRIEVAL_END -->"
@@ -420,6 +424,9 @@ class MemoryExtension(Extension):
             workspace = getattr(context._agent_config, "workspace_root", ".") or "."
 
         self._store = MemoryStore(workspace)
+        self._entries_cache_key = ()
+        self._entries_cache_rows = []
+        self._block_cache = {}
         agent_cfg = getattr(context, "_agent_config", None)
         self._topk = max(0, int(getattr(agent_cfg, "memory_topk", 0) or 0))
         self._retrieval_token_budget = max(
@@ -458,11 +465,37 @@ class MemoryExtension(Extension):
     def _tokenize_query(text: str) -> set[str]:
         return {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())}
 
-    def _collect_memory_entries(self) -> list[tuple[str, str, str, int]]:
-        """Return [(scope, title, body, saved_ordinal)] from topic files (excluding MEMORY index)."""
+    @staticmethod
+    def _extract_meta_value(chunk: str, key: str) -> str:
+        m = re.search(rf"{re.escape(key)}:\s*([^|*]+)", chunk, flags=re.I)
+        return (m.group(1).strip() if m else "")
+
+    def _current_snapshot_key(self) -> tuple[tuple[str, int, int], ...]:
+        if self._store is None:
+            return ()
+        snapshot: list[tuple[str, int, int]] = []
+        for _, root in (("local", self._store.root), ("global", self._store.global_root)):
+            if not root.is_dir():
+                continue
+            for f in sorted(root.glob("*.md")):
+                if f.name == ENTRYPOINT_NAME:
+                    continue
+                try:
+                    st = f.stat()
+                    snapshot.append((str(f), int(st.st_mtime_ns), int(st.st_size)))
+                except Exception:  # noqa: BLE001
+                    snapshot.append((str(f), 0, 0))
+        return tuple(snapshot)
+
+    def _collect_memory_entries(self) -> list[dict[str, Any]]:
+        """Collect memory entries with retrieval metadata from topic files."""
         if self._store is None:
             return []
-        entries: list[tuple[str, str, str, int]] = []
+        snapshot_key = self._current_snapshot_key()
+        if snapshot_key == self._entries_cache_key and self._entries_cache_rows:
+            return list(self._entries_cache_rows)
+
+        entries: list[dict[str, Any]] = []
         for scope, root in (("local", self._store.root), ("global", self._store.global_root)):
             if not root.is_dir():
                 continue
@@ -488,7 +521,39 @@ class MemoryExtension(Extension):
                             saved_ordinal = date.fromisoformat(m.group(1)).toordinal()
                         except Exception:  # noqa: BLE001
                             saved_ordinal = 0
-                    entries.append((scope, title, body, saved_ordinal))
+                    confidence = 0.70
+                    confidence_raw = self._extract_meta_value(chunk, "confidence")
+                    if confidence_raw:
+                        try:
+                            confidence = max(0.0, min(1.0, float(confidence_raw)))
+                        except Exception:  # noqa: BLE001
+                            confidence = 0.70
+                    conflict_raw = self._extract_meta_value(chunk, "conflict").lower()
+                    conflict_penalty = 0.0
+                    if conflict_raw.startswith("supersedes-"):
+                        try:
+                            supersedes_n = int(conflict_raw.split("-", 1)[1])
+                            conflict_penalty = min(0.35, 0.08 * supersedes_n)
+                        except Exception:  # noqa: BLE001
+                            conflict_penalty = 0.10
+                    explicitness = self._extract_meta_value(chunk, "explicitness").lower() or "explicit"
+                    source = self._extract_meta_value(chunk, "source")
+                    entries.append(
+                        {
+                            "scope": scope,
+                            "title": title,
+                            "body": body,
+                            "saved_ordinal": saved_ordinal,
+                            "confidence": confidence,
+                            "conflict_penalty": conflict_penalty,
+                            "explicitness": explicitness,
+                            "source": source,
+                        }
+                    )
+        self._entries_cache_key = snapshot_key
+        self._entries_cache_rows = list(entries)
+        # Retrieval blocks depend on parsed rows, so invalidate block cache on source change.
+        self._block_cache = {}
         return entries
 
     def _score_retrieval_entry(
@@ -499,12 +564,15 @@ class MemoryExtension(Extension):
         title: str,
         body: str,
         saved_ordinal: int,
-    ) -> float:
+        confidence: float,
+        conflict_penalty: float,
+        explicitness: str,
+    ) -> tuple[float, dict[str, Any]]:
         hay = f"{title}\n{body}".lower()
         entry_tokens = self._tokenize_query(hay)
         overlap = len(query_tokens & entry_tokens)
         if overlap == 0:
-            return 0.0
+            return 0.0, {}
 
         coverage = overlap / max(1, len(query_tokens))
         title_tokens = self._tokenize_query(title)
@@ -519,33 +587,78 @@ class MemoryExtension(Extension):
                 recency_boost = 0.15
 
         scope_boost = 0.10 if scope == "global" else 0.0
+        explicit_boost = 0.05 if explicitness == "explicit" else 0.0
 
-        return overlap + coverage + (title_hit * 0.50) + recency_boost + scope_boost
+        age_days = max(0, date.today().toordinal() - saved_ordinal) if saved_ordinal > 0 else 365
+        decay_half_life_days = max(1.0, float(os.getenv("TAU_MEMORY_CONFIDENCE_HALF_LIFE_DAYS", "45")))
+        decay = math.exp(-math.log(2.0) * (age_days / decay_half_life_days))
+        effective_confidence = max(0.05, min(1.0, confidence * decay))
+
+        raw_score = overlap + coverage + (title_hit * 0.50) + recency_boost + scope_boost + explicit_boost
+        final_score = (raw_score * (0.5 + effective_confidence)) - conflict_penalty
+        why = {
+            "overlap": overlap,
+            "coverage": round(coverage, 3),
+            "title_hit": title_hit,
+            "age_days": age_days,
+            "decay": round(decay, 3),
+            "confidence": round(confidence, 3),
+            "effective_confidence": round(effective_confidence, 3),
+            "recency_boost": round(recency_boost, 3),
+            "scope_boost": round(scope_boost, 3),
+            "explicit_boost": round(explicit_boost, 3),
+            "conflict_penalty": round(conflict_penalty, 3),
+            "final_score": round(final_score, 3),
+        }
+        return final_score, why
 
     def _build_retrieval_block(self, query: str, topk: int) -> str:
         q = self._tokenize_query(query)
         if not q:
             return ""
+        if self._store is not None:
+            current_snapshot = self._current_snapshot_key()
+            if current_snapshot != self._entries_cache_key:
+                self._entries_cache_key = ()
+                self._entries_cache_rows = []
+                self._block_cache = {}
+        cache_key = (query.strip().lower(), int(topk), self._entries_cache_key)
+        cached = self._block_cache.get(cache_key)
+        if cached is not None:
+            return cached
         min_score = float(os.getenv("TAU_MEMORY_RETRIEVAL_MIN_SCORE", "1.2"))
-        scored: list[tuple[float, str]] = []
-        for scope, title, body, saved_ordinal in self._collect_memory_entries():
-            score = self._score_retrieval_entry(
+        scored: list[tuple[float, str, dict[str, Any]]] = []
+        for row in self._collect_memory_entries():
+            score, why = self._score_retrieval_entry(
                 query_tokens=q,
-                scope=scope,
-                title=title,
-                body=body,
-                saved_ordinal=saved_ordinal,
+                scope=str(row.get("scope", "")),
+                title=str(row.get("title", "")),
+                body=str(row.get("body", "")),
+                saved_ordinal=int(row.get("saved_ordinal", 0) or 0),
+                confidence=float(row.get("confidence", 0.7) or 0.7),
+                conflict_penalty=float(row.get("conflict_penalty", 0.0) or 0.0),
+                explicitness=str(row.get("explicitness", "explicit")),
             )
             if score < min_score:
                 continue
-            scored.append((score, f"- ({scope}) {title}: {body}"))
+            scope = str(row.get("scope", "local"))
+            title = str(row.get("title", ""))
+            body = str(row.get("body", ""))
+            explain = (
+                f"why: overlap={why.get('overlap', 0)}, "
+                f"eff_conf={why.get('effective_confidence', 0)}, "
+                f"conflict_penalty={why.get('conflict_penalty', 0)}, "
+                f"score={why.get('final_score', 0)}"
+            )
+            scored.append((score, f"- ({scope}) {title}: {body}\n  [{explain}]", why))
         if not scored:
+            self._block_cache[cache_key] = ""
             return ""
         scored.sort(key=lambda x: x[0], reverse=True)
         selected: list[str] = []
         budget = self._retrieval_token_budget
         used = self._estimate_tokens("Relevant memory for this turn:\n")
-        for _, line in scored[: max(1, topk * 4)]:
+        for _, line, _ in scored[: max(1, topk * 4)]:
             cost = self._estimate_tokens(line)
             if len(selected) >= topk:
                 break
@@ -554,8 +667,11 @@ class MemoryExtension(Extension):
             selected.append(line)
             used += cost
         if not selected:
+            self._block_cache[cache_key] = ""
             return ""
-        return "Relevant memory for this turn:\n" + "\n".join(selected)
+        block = "Relevant memory for this turn:\n" + "\n".join(selected)
+        self._block_cache[cache_key] = block
+        return block
 
     def _upsert_retrieval_fragment(self, block: str) -> None:
         if self._ext_context is None:
