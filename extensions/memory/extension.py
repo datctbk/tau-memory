@@ -574,6 +574,8 @@ class MemoryExtension(Extension):
         self._entries_cache_key: tuple[tuple[str, int, int], ...] = ()
         self._entries_cache_rows: list[dict[str, Any]] = []
         self._block_cache: dict[tuple[str, int, tuple[tuple[str, int, int], ...]], str] = {}
+        self._code_index_gate_enabled = os.getenv("TAU_MEMORY_CODE_INDEX_GATING", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self._last_code_index_stats: dict[str, Any] | None = None
 
     _RETRIEVAL_START = "<!-- TAU_MEMORY_RETRIEVAL_START -->"
     _RETRIEVAL_END = "<!-- TAU_MEMORY_RETRIEVAL_END -->"
@@ -833,6 +835,13 @@ class MemoryExtension(Extension):
         q = self._tokenize_query(query)
         if not q:
             return ""
+        # Gating: if code index reports no changed files and we already have
+        # parsed entries cached, avoid maintenance refresh work.
+        if self._code_index_gate_enabled and self._entries_cache_rows and not self._code_index_has_changes():
+            cache_key_static = (query.strip().lower(), int(topk), self._entries_cache_key)
+            cached_static = self._block_cache.get(cache_key_static)
+            if cached_static is not None:
+                return cached_static
         current_snapshot: tuple[tuple[str, int, int], ...] = ()
         if self._store is not None:
             current_snapshot = self._current_snapshot_key()
@@ -1333,6 +1342,8 @@ class MemoryExtension(Extension):
             self._maybe_auto_update()
 
     def _maybe_auto_update(self) -> None:
+        if self._code_index_gate_enabled and not self._code_index_has_changes():
+            return
         if self._auto_updates_done >= self._auto_max_updates:
             return
         if self._turns_since_auto < self._auto_min_turns and self._tool_results_since_auto < self._auto_min_tool_results:
@@ -1363,6 +1374,21 @@ class MemoryExtension(Extension):
                 self._ext_context.print("[dim]Auto memory updated.[/dim]")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Auto memory update failed: %s", exc)
+
+    def _code_index_has_changes(self) -> bool:
+        """Use persisted code-index stats to skip heavy memory work when idle."""
+        if self._store is None:
+            return True
+        try:
+            from tau.core.code_index import load_index_stats
+
+            stats = load_index_stats(self._store.root.parent.parent)
+            self._last_code_index_stats = stats
+            if not stats:
+                return True
+            return int(stats.get("changed_count", 1)) > 0
+        except Exception:  # noqa: BLE001
+            return True
 
     def _build_auto_memory_candidate(self) -> tuple[str, str] | None:
         if self._ext_context is None:
