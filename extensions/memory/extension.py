@@ -75,10 +75,21 @@ class MemoryStore:
     """
 
     def __init__(self, workspace: str, global_root: str | None = None) -> None:
-        self._root = Path(workspace) / ".tau" / "memory"
+        ws_root = Path(workspace).resolve()
+        self._root = ws_root / ".tau" / "memory"
         if global_root is None:
             global_root = os.getenv("TAU_MEMORY_GLOBAL_DIR", "~/.tau/memory")
-        self._global_root = Path(global_root).expanduser()
+        candidate = Path(global_root).expanduser()
+        # Sandbox-safe fallback: if the default global dir is not writable,
+        # keep global memory in workspace-local storage.
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".tau_memory_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            self._global_root = candidate
+        except Exception:  # noqa: BLE001
+            self._global_root = ws_root / ".tau" / "memory-global"
 
     @property
     def root(self) -> Path:
@@ -258,11 +269,60 @@ class MemoryStore:
         self.ensure_dir()
         log_path = self.structured_log_path(scope)
         now = datetime.now(timezone.utc).isoformat()
-        digest = hashlib.sha256(f"{title}\n{content}".encode("utf-8")).hexdigest()[:16]
+        clean_title = title.strip()
+        clean_content = content.strip()
+        key = self._record_key(memory_type=memory_type, topic=topic, title=clean_title)
+        digest = hashlib.sha256(f"{clean_title}\n{clean_content}".encode("utf-8")).hexdigest()[:16]
+        rows = self._read_structured_rows(scope)
+
+        # Upsert semantics:
+        # - same key + same content => update metadata in-place (dedupe)
+        # - same key + different content => supersede previous active record
+        prev_active_idx = -1
+        prev_active_row: dict[str, Any] | None = None
+        for i in range(len(rows) - 1, -1, -1):
+            row = rows[i]
+            if row.get("key") == key and bool(row.get("active", True)):
+                prev_active_idx = i
+                prev_active_row = row
+                break
+
+        if prev_active_row and (prev_active_row.get("content", "").strip() == clean_content):
+            merged_tags = sorted(set(prev_active_row.get("tags", [])) | {t.strip().lower() for t in tags if t and t.strip()})
+            prev_active_row["updated_at"] = now
+            prev_active_row["tags"] = merged_tags
+            if source and source.strip():
+                prev_active_row["source"] = source.strip()
+            if session_id:
+                prev_active_row["session_id"] = session_id
+            if confidence is not None:
+                try:
+                    prev_active_row["confidence"] = max(
+                        float(prev_active_row.get("confidence", 0.0) or 0.0),
+                        max(0.0, min(1.0, float(confidence))),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            rows[prev_active_idx] = prev_active_row
+            self._write_structured_rows(scope, rows)
+            return
+
+        record_id = f"mem_{digest}_{int(time.time() * 1000)}"
+        version = 1
+        if prev_active_row is not None:
+            prev_active_row["active"] = False
+            prev_active_row["superseded_by"] = record_id
+            prev_active_row["updated_at"] = now
+            rows[prev_active_idx] = prev_active_row
+            version = int(prev_active_row.get("version", 1) or 1) + 1
+
         record = {
-            "id": f"mem_{digest}_{int(time.time() * 1000)}",
-            "title": title.strip(),
-            "content": content.strip(),
+            "id": record_id,
+            "key": key,
+            "version": version,
+            "active": True,
+            "title": clean_title,
+            "content": clean_content,
             "memory_type": memory_type,
             "topic": topic,
             "scope": scope,
@@ -274,8 +334,36 @@ class MemoryStore:
             "created_at": now,
             "updated_at": now,
         }
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        rows.append(record)
+        self._write_structured_rows(scope, rows)
+
+    @staticmethod
+    def _record_key(*, memory_type: str, topic: str, title: str) -> str:
+        norm_title = re.sub(r"\s+", " ", title.strip().lower())
+        return f"{memory_type}:{topic}:{norm_title}"
+
+    def _read_structured_rows(self, scope: str) -> list[dict[str, Any]]:
+        p = self.structured_log_path(scope)
+        if not p.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+
+    def _write_structured_rows(self, scope: str, rows: list[dict[str, Any]]) -> None:
+        self.ensure_dir()
+        p = self.structured_log_path(scope)
+        with p.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def query_records(
         self,
@@ -286,20 +374,14 @@ class MemoryStore:
         session_id: str | None = None,
         tags: list[str] | None = None,
         limit: int = 10,
+        active_only: bool = True,
     ) -> list[dict[str, Any]]:
         scopes = [scope] if scope in {"local", "global"} else ["local", "global"]
         rows: list[dict[str, Any]] = []
         wanted_tags = {t.strip().lower() for t in (tags or []) if t and t.strip()}
         for sc in scopes:
-            p = self.structured_log_path(sc)
-            if not p.is_file():
-                continue
-            for line in p.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:  # noqa: BLE001
+            for row in self._read_structured_rows(sc):
+                if active_only and not bool(row.get("active", True)):
                     continue
                 if memory_type and row.get("memory_type") != memory_type:
                     continue
@@ -429,6 +511,9 @@ project context, or external references — save it using the `memory_save` tool
 
 ### Strict Write Discipline
 **NEVER** save memory about an intended code change or shell command until AFTER you have received the tool result confirming that the action was completely successful. This prevents hallucinated states where you misremember broken logic as fixed.
+
+### Structured Query First
+When recalling specific prior decisions/preferences, prefer metadata-aware lookup via `memory_query` (e.g. by `session_id`, `memory_type`, or `tags`) before broad topic reads.
 
 ### Current Memory Index
 {memory_content if memory_content else "(No memories saved yet.)"}
@@ -567,7 +652,9 @@ class MemoryExtension(Extension):
         for _, root in (("local", self._store.root), ("global", self._store.global_root)):
             if not root.is_dir():
                 continue
-            for f in sorted(root.glob("*.md")):
+            for f in sorted(root.glob("*")):
+                if f.suffix not in {".md", ".jsonl"}:
+                    continue
                 if f.name == ENTRYPOINT_NAME:
                     continue
                 try:
@@ -577,8 +664,39 @@ class MemoryExtension(Extension):
                     snapshot.append((str(f), 0, 0))
         return tuple(snapshot)
 
+    def _collect_structured_entries(self) -> list[dict[str, Any]]:
+        if self._store is None:
+            return []
+        rows = self._store.query_records(limit=500, active_only=True)
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            created = str(row.get("created_at", ""))
+            saved_ordinal = 0
+            if created:
+                try:
+                    saved_ordinal = datetime.fromisoformat(created.replace("Z", "+00:00")).date().toordinal()
+                except Exception:  # noqa: BLE001
+                    saved_ordinal = 0
+            entries.append(
+                {
+                    "scope": row.get("scope", "local"),
+                    "title": row.get("title", ""),
+                    "body": str(row.get("content", ""))[:500],
+                    "saved_ordinal": saved_ordinal,
+                    "confidence": float(row.get("confidence", 0.70) or 0.70),
+                    "conflict_penalty": 0.0,
+                    "explicitness": row.get("explicitness", "explicit"),
+                    "source": row.get("source", ""),
+                    "tags": row.get("tags", []),
+                }
+            )
+        return entries
+
     def _collect_memory_entries(self) -> list[dict[str, Any]]:
-        """Collect memory entries with retrieval metadata from topic files."""
+        """Collect memory entries with retrieval metadata.
+
+        Prefer structured records (memory_query path) and fall back to topic markdown.
+        """
         if self._store is None:
             return []
         snapshot_key = self._current_snapshot_key()
@@ -586,6 +704,15 @@ class MemoryExtension(Extension):
             return list(self._entries_cache_rows)
 
         entries: list[dict[str, Any]] = []
+        structured = self._collect_structured_entries()
+        if structured:
+            entries.extend(structured)
+            self._entries_cache_key = snapshot_key
+            self._entries_cache_rows = list(entries)
+            self._block_cache = {}
+            return entries
+
+        # Fallback path for legacy memory files without structured records.
         for scope, root in (("local", self._store.root), ("global", self._store.global_root)):
             if not root.is_dir():
                 continue
@@ -706,13 +833,14 @@ class MemoryExtension(Extension):
         q = self._tokenize_query(query)
         if not q:
             return ""
+        current_snapshot: tuple[tuple[str, int, int], ...] = ()
         if self._store is not None:
             current_snapshot = self._current_snapshot_key()
             if current_snapshot != self._entries_cache_key:
                 self._entries_cache_key = ()
                 self._entries_cache_rows = []
                 self._block_cache = {}
-        cache_key = (query.strip().lower(), int(topk), self._entries_cache_key)
+        cache_key = (query.strip().lower(), int(topk), current_snapshot)
         cached = self._block_cache.get(cache_key)
         if cached is not None:
             return cached

@@ -268,6 +268,27 @@ class TestStructuredQueryAndExtraction:
         queried = ext._handle_memory_query(session_id="sess_xyz", tags=["decision"])
         assert "Retry policy decision" in queried
 
+    def test_upsert_supersedes_prior_active_record(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("Deployment Preference", "Use blue/green deploys.", "project")
+        ext._handle_memory_save("Deployment Preference", "Use canary deploys.", "project")
+        result = ext._handle_memory_query(topic="project", limit=10)
+        assert "Use canary deploys." not in result  # table doesn't include content
+        # Verify store-level active filtering
+        rows = ext._store.query_records(topic="project", limit=10, active_only=True)
+        matching = [r for r in rows if r.get("title") == "Deployment Preference"]
+        assert len(matching) == 1
+        assert matching[0].get("content") == "Use canary deploys."
+
+    def test_dedupe_same_content_does_not_create_new_version(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("Coding Style", "Prefer small pure functions.", "feedback", tags=["style"])
+        ext._handle_memory_save("Coding Style", "Prefer small pure functions.", "feedback", tags=["python"])
+        rows_all = ext._store.query_records(topic="feedback", limit=20, active_only=False)
+        matching = [r for r in rows_all if r.get("title") == "Coding Style"]
+        assert len(matching) == 1
+        assert set(matching[0].get("tags", [])) >= {"style", "python"}
+
 
 # ---------------------------------------------------------------------------
 # System prompt injection

@@ -5,3 +5,6 @@ extensions/memory/__pycache__/extension.cpython-310.pyc
 tests/__pycache__/test_extension.cpython-39-pytest-8.4.2.pyc
 extensions/memory/__pycache__/extension.cpython-39.pyc
 tests/__pycache__/__init__.cpython-39.pyc
+extensions/memory/__pycache__/extension.cpython-311.pyc
+tests/__pycache__/test_extension.cpython-311-pytest-7.4.4.pyc
+tests/__pycache__/__init__.cpython-311.pyc
