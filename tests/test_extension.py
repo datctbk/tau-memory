@@ -72,15 +72,15 @@ class TestManifest:
 # ---------------------------------------------------------------------------
 
 class TestToolsRegistration:
-    def test_registers_two_tools(self, ext_with_store):
+    def test_registers_tools(self, ext_with_store):
         ext, _, _ = ext_with_store
         tools = ext.tools()
-        assert len(tools) == 2
+        assert len(tools) >= 4
 
     def test_tool_names(self, ext_with_store):
         ext, _, _ = ext_with_store
         names = {t.name for t in ext.tools()}
-        assert names == {"memory_save", "memory_read"}
+        assert {"memory_save", "memory_read", "memory_query", "memory_extract_session"}.issubset(names)
 
     def test_memory_save_params(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -176,6 +176,22 @@ class TestMemorySaveHandler:
         assert "confidence: 0.95" in text
         assert "source: user-explicit" in text
 
+    def test_save_with_session_and_tags_in_structured_log(self, ext_with_store):
+        ext, _, tmp_path = ext_with_store
+        result = ext._handle_memory_save(
+            title="Session fact",
+            content="User asked to keep responses concise.",
+            memory_type="feedback",
+            session_id="sess_1",
+            tags=["style", "concise"],
+        )
+        assert "saved" in result.lower()
+        log_path = tmp_path / ".tau" / "memory-global" / "memory_records.jsonl"
+        assert log_path.is_file()
+        rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert any(r.get("session_id") == "sess_1" for r in rows)
+        assert any("concise" in r.get("tags", []) for r in rows)
+
     def test_save_no_store(self):
         ext = MemoryExtension()
         ext._store = None
@@ -228,6 +244,29 @@ class TestMemoryReadHandler:
         ext._store = None
         result = ext._handle_memory_read(topic="list")
         assert "Error" in result
+
+
+class TestStructuredQueryAndExtraction:
+    def test_memory_query_filters_by_session(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._handle_memory_save("A", "alpha", "project", session_id="s1", tags=["alpha"])
+        ext._handle_memory_save("B", "beta", "project", session_id="s2", tags=["beta"])
+        result = ext._handle_memory_query(session_id="s2", limit=5)
+        assert "B" in result
+        assert "A" not in result
+
+    def test_memory_extract_session_creates_record(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        result = ext._handle_memory_extract_session(
+            session_id="sess_xyz",
+            session_text="We decided to keep retry max attempts at 3 for stability.",
+            memory_type="project",
+            title="Retry policy decision",
+            tags=["decision", "retries"],
+        )
+        assert "saved" in result.lower()
+        queried = ext._handle_memory_query(session_id="sess_xyz", tags=["decision"])
+        assert "Retry policy decision" in queried
 
 
 # ---------------------------------------------------------------------------

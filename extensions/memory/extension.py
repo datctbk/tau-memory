@@ -59,6 +59,7 @@ MAX_ENTRYPOINT_LINES = 200
 MAX_ENTRYPOINT_BYTES = 25_000
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 GLOBAL_MEMORY_TYPES = {"user", "feedback"}
+STRUCTURED_LOG_NAME = "memory_records.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,9 @@ class MemoryStore:
         """Create memory directory if it doesn't exist."""
         self._root.mkdir(parents=True, exist_ok=True)
         self._global_root.mkdir(parents=True, exist_ok=True)
+
+    def structured_log_path(self, scope: str = "local") -> Path:
+        return self._scope_root(scope) / STRUCTURED_LOG_NAME
 
     def exists(self, scope: str = "local") -> bool:
         path = self.global_entrypoint if scope == "global" else self.entrypoint
@@ -165,6 +169,8 @@ class MemoryStore:
         confidence: float | None = None,
         source: str | None = None,
         explicitness: str = "explicit",
+        session_id: str | None = None,
+        tags: list[str] | None = None,
     ) -> str:
         """Save a memory entry to the appropriate topic file and update the index.
 
@@ -220,8 +226,92 @@ class MemoryStore:
 
         # Update index
         self._update_index(title, f"{topic}.md", memory_type, resolved_scope)
+        self._append_structured_record(
+            title=title,
+            content=content,
+            memory_type=memory_type,
+            topic=topic,
+            scope=resolved_scope,
+            confidence=confidence,
+            source=source,
+            explicitness=exp,
+            session_id=session_id,
+            tags=tags or [],
+        )
 
         return str(topic_file)
+
+    def _append_structured_record(
+        self,
+        *,
+        title: str,
+        content: str,
+        memory_type: str,
+        topic: str,
+        scope: str,
+        confidence: float | None,
+        source: str | None,
+        explicitness: str,
+        session_id: str | None,
+        tags: list[str],
+    ) -> None:
+        self.ensure_dir()
+        log_path = self.structured_log_path(scope)
+        now = datetime.now(timezone.utc).isoformat()
+        digest = hashlib.sha256(f"{title}\n{content}".encode("utf-8")).hexdigest()[:16]
+        record = {
+            "id": f"mem_{digest}_{int(time.time() * 1000)}",
+            "title": title.strip(),
+            "content": content.strip(),
+            "memory_type": memory_type,
+            "topic": topic,
+            "scope": scope,
+            "confidence": confidence,
+            "source": (source or "").strip(),
+            "explicitness": explicitness,
+            "session_id": session_id or "",
+            "tags": [t.strip().lower() for t in tags if t and t.strip()],
+            "created_at": now,
+            "updated_at": now,
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def query_records(
+        self,
+        *,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        topic: str | None = None,
+        session_id: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        scopes = [scope] if scope in {"local", "global"} else ["local", "global"]
+        rows: list[dict[str, Any]] = []
+        wanted_tags = {t.strip().lower() for t in (tags or []) if t and t.strip()}
+        for sc in scopes:
+            p = self.structured_log_path(sc)
+            if not p.is_file():
+                continue
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if memory_type and row.get("memory_type") != memory_type:
+                    continue
+                if topic and row.get("topic") != topic:
+                    continue
+                if session_id and row.get("session_id") != session_id:
+                    continue
+                if wanted_tags and not wanted_tags.issubset(set(row.get("tags", []))):
+                    continue
+                rows.append(row)
+        rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        return rows[: max(1, int(limit))]
 
     def _update_index(self, title: str, filename: str, memory_type: str, scope: str) -> None:
         """Add or update an entry in MEMORY.md."""
@@ -755,6 +845,16 @@ class MemoryExtension(Extension):
                         description="Whether the fact is explicit or inferred. One of: explicit, inferred.",
                         required=False,
                     ),
+                    "session_id": ToolParameter(
+                        type="string",
+                        description="Optional session ID this memory came from.",
+                        required=False,
+                    ),
+                    "tags": ToolParameter(
+                        type="array",
+                        description="Optional tag list for structured memory retrieval.",
+                        required=False,
+                    ),
                 },
                 handler=self._handle_memory_save,
             ),
@@ -775,6 +875,77 @@ class MemoryExtension(Extension):
                     ),
                 },
                 handler=self._handle_memory_read,
+            ),
+            ToolDefinition(
+                name="memory_query",
+                description=(
+                    "Query structured memory records by scope/type/topic/session/tags. "
+                    "Use this for session-level or metadata-based recall."
+                ),
+                parameters={
+                    "scope": ToolParameter(
+                        type="string",
+                        description="Optional scope filter: local or global.",
+                        required=False,
+                    ),
+                    "memory_type": ToolParameter(
+                        type="string",
+                        description="Optional memory type filter.",
+                        required=False,
+                    ),
+                    "topic": ToolParameter(
+                        type="string",
+                        description="Optional topic filter.",
+                        required=False,
+                    ),
+                    "session_id": ToolParameter(
+                        type="string",
+                        description="Optional session ID filter.",
+                        required=False,
+                    ),
+                    "tags": ToolParameter(
+                        type="array",
+                        description="Optional tag filters; all provided tags must match.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum number of records to return (default 10).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_memory_query,
+            ),
+            ToolDefinition(
+                name="memory_extract_session",
+                description=(
+                    "Extract a structured memory candidate from a session snippet and save it. "
+                    "Minimal deterministic extractor for session-level memory capture."
+                ),
+                parameters={
+                    "session_id": ToolParameter(
+                        type="string",
+                        description="Source session ID for provenance.",
+                    ),
+                    "session_text": ToolParameter(
+                        type="string",
+                        description="Session text snippet to extract from.",
+                    ),
+                    "memory_type": ToolParameter(
+                        type="string",
+                        description="Target memory type: user, feedback, project, reference.",
+                    ),
+                    "title": ToolParameter(
+                        type="string",
+                        description="Short memory title.",
+                    ),
+                    "tags": ToolParameter(
+                        type="array",
+                        description="Optional tags for structured query later.",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_memory_extract_session,
             ),
         ]
 
@@ -818,6 +989,8 @@ class MemoryExtension(Extension):
         confidence: float | None = None,
         source: str | None = None,
         explicitness: str = "explicit",
+        session_id: str | None = None,
+        tags: list[str] | None = None,
     ) -> str:
         if self._store is None:
             return "Error: Memory store not initialized."
@@ -834,10 +1007,71 @@ class MemoryExtension(Extension):
                 confidence=confidence,
                 source=source,
                 explicitness=explicitness,
+                session_id=session_id,
+                tags=tags,
             )
             return f"Memory saved: '{title}' → {path}"
         except Exception as e:
             return f"Error saving memory: {e}"
+
+    def _handle_memory_query(
+        self,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        topic: str | None = None,
+        session_id: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> str:
+        if self._store is None:
+            return "Error: Memory store not initialized."
+        rows = self._store.query_records(
+            scope=scope,
+            memory_type=memory_type,
+            topic=topic,
+            session_id=session_id,
+            tags=tags,
+            limit=limit,
+        )
+        if not rows:
+            return "No structured memory records matched."
+        lines = [
+            "| id | scope | type | topic | session | title | tags |",
+            "|----|-------|------|-------|---------|-------|------|",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r.get('id','')} | {r.get('scope','')} | {r.get('memory_type','')} | "
+                f"{r.get('topic','')} | {r.get('session_id','')} | {str(r.get('title',''))[:60]} | "
+                f"{', '.join(r.get('tags', []))} |"
+            )
+        return "\n".join(lines)
+
+    def _handle_memory_extract_session(
+        self,
+        session_id: str,
+        session_text: str,
+        memory_type: str,
+        title: str,
+        tags: list[str] | None = None,
+    ) -> str:
+        if self._store is None:
+            return "Error: Memory store not initialized."
+        if memory_type not in MEMORY_TYPES:
+            return f"Error: Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}"
+        clean = " ".join((session_text or "").split())
+        if not clean:
+            return "Error: session_text is empty."
+        content = clean[:700]
+        return self._handle_memory_save(
+            title=title,
+            content=content,
+            memory_type=memory_type,
+            source="session-extract",
+            explicitness="inferred",
+            session_id=session_id,
+            tags=tags or ["session"],
+        )
 
     def _handle_memory_read(self, topic: str) -> str:
         if self._store is None:
