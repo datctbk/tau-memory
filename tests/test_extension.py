@@ -80,7 +80,7 @@ class TestToolsRegistration:
     def test_tool_names(self, ext_with_store):
         ext, _, _ = ext_with_store
         names = {t.name for t in ext.tools()}
-        assert {"memory_save", "memory_read", "memory_query", "memory_extract_session"}.issubset(names)
+        assert {"memory_save", "memory_read", "memory_query", "memory_extract_session", "memory_search"}.issubset(names)
 
     def test_memory_save_params(self, ext_with_store):
         ext, _, _ = ext_with_store
@@ -198,6 +198,59 @@ class TestMemorySaveHandler:
         result = ext._handle_memory_save("T", "C", "user")
         assert "Error" in result
 
+    def test_save_strict_policy_denies_missing_fields(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._write_policy_strict = True
+        ext._require_source = True
+        ext._require_confidence = True
+        ext._require_why_saved = True
+        result = ext._handle_memory_save(
+            title="Denied",
+            content="Should be denied by policy",
+            memory_type="project",
+        )
+        assert "denied by policy" in result
+
+    def test_save_policy_warning_when_not_strict(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        ext._write_policy_strict = False
+        ext._require_source = True
+        ext._require_confidence = True
+        ext._require_why_saved = True
+        result = ext._handle_memory_save(
+            title="Warned",
+            content="Should save with warning",
+            memory_type="project",
+        )
+        assert "saved with policy warnings" in result.lower()
+
+    def test_save_audit_log_written(self, ext_with_store, tmp_path):
+        ext, _, _ = ext_with_store
+        ext._write_policy_strict = True
+        ext._require_source = True
+        ext._require_confidence = True
+        ext._require_why_saved = True
+
+        _ = ext._handle_memory_save(
+            title="Denied audit",
+            content="x",
+            memory_type="project",
+        )
+        _ = ext._handle_memory_save(
+            title="Allowed audit",
+            content="y",
+            memory_type="project",
+            source="user-explicit",
+            confidence=0.9,
+            why_saved="user explicitly asked to remember this",
+        )
+        p = tmp_path / ".tau" / "memory" / "memory_audit.jsonl"
+        assert p.is_file()
+        rows = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        decisions = [r.get("decision") for r in rows]
+        assert "deny" in decisions
+        assert "allow" in decisions
+
 
 # ---------------------------------------------------------------------------
 # memory_read handler
@@ -288,6 +341,44 @@ class TestStructuredQueryAndExtraction:
         matching = [r for r in rows_all if r.get("title") == "Coding Style"]
         assert len(matching) == 1
         assert set(matching[0].get("tags", [])) >= {"style", "python"}
+
+    def test_memory_search_returns_table(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        fake_db = MagicMock()
+        fake_db.search_messages.return_value = [
+            {
+                "session_id": "sess_1",
+                "source": "cli",
+                "role": "user",
+                "snippet": ">>>scheduler<<< fairness tuning",
+                "timestamp": 123.0,
+            }
+        ]
+        with patch("tau.core.state.SessionDB", return_value=fake_db):
+            out = ext._handle_memory_search("scheduler fairness")
+        assert "session_id" in out
+        assert "sess_1" in out
+        assert "scheduler" in out
+
+    def test_memory_search_session_filter(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        fake_db = MagicMock()
+        fake_db.search_messages.return_value = [
+            {"session_id": "sess_a", "source": "cli", "role": "user", "snippet": "A", "timestamp": 1},
+            {"session_id": "sess_b", "source": "cli", "role": "assistant", "snippet": "B", "timestamp": 2},
+        ]
+        with patch("tau.core.state.SessionDB", return_value=fake_db):
+            out = ext._handle_memory_search("x", session_id="sess_b")
+        assert "sess_b" in out
+        assert "sess_a" not in out
+
+    def test_memory_search_no_match(self, ext_with_store):
+        ext, _, _ = ext_with_store
+        fake_db = MagicMock()
+        fake_db.search_messages.return_value = []
+        with patch("tau.core.state.SessionDB", return_value=fake_db):
+            out = ext._handle_memory_search("nope")
+        assert "No session messages matched." in out
 
 
 # ---------------------------------------------------------------------------
@@ -572,3 +663,41 @@ class TestTopKRetrieval:
         ext._handle_memory_save("New Prefs", "User now wants detailed design notes.", "user")
         block3 = ext._build_retrieval_block("detailed design notes", topk=1)
         assert "New Prefs" in block3
+
+    def test_hybrid_retrieval_combines_memory_and_session_hits(self, tmp_path):
+        ext = MemoryExtension()
+
+        class _Inner:
+            def __init__(self):
+                self._messages = [Message(role="system", content="base")]
+
+        ctx = MagicMock()
+        ctx.print = MagicMock()
+        ctx.enqueue = MagicMock()
+        ctx.inject_prompt_fragment = MagicMock()
+        ctx._context = _Inner()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ctx._agent_config.memory_topk = 3
+
+        ext.on_load(ctx)
+        ext._handle_memory_save("Scheduler Plan", "Keep scheduler fairness stable.", "project")
+
+        with patch.object(
+            ext,
+            "_collect_session_hits",
+            return_value=[
+                {
+                    "session_id": "sess_abc",
+                    "source": "cli",
+                    "role": "user",
+                    "snippet": "please improve scheduler fairness",
+                    "timestamp": 1,
+                }
+            ],
+        ):
+            block = ext._build_retrieval_block("scheduler fairness", topk=3)
+
+        assert "[memory:" in block
+        assert "[session:" in block
+        assert "sess_abc" in block

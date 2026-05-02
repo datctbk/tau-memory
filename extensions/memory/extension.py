@@ -60,6 +60,7 @@ MAX_ENTRYPOINT_BYTES = 25_000
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 GLOBAL_MEMORY_TYPES = {"user", "feedback"}
 STRUCTURED_LOG_NAME = "memory_records.jsonl"
+AUDIT_LOG_NAME = "memory_audit.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +125,9 @@ class MemoryStore:
     def structured_log_path(self, scope: str = "local") -> Path:
         return self._scope_root(scope) / STRUCTURED_LOG_NAME
 
+    def audit_log_path(self, scope: str = "local") -> Path:
+        return self._scope_root(scope) / AUDIT_LOG_NAME
+
     def exists(self, scope: str = "local") -> bool:
         path = self.global_entrypoint if scope == "global" else self.entrypoint
         return path.is_file()
@@ -182,6 +186,7 @@ class MemoryStore:
         explicitness: str = "explicit",
         session_id: str | None = None,
         tags: list[str] | None = None,
+        why_saved: str | None = None,
     ) -> str:
         """Save a memory entry to the appropriate topic file and update the index.
 
@@ -205,6 +210,7 @@ class MemoryStore:
                 confidence_str = ""
 
         source_str = f" | source: {source.strip()}" if source and source.strip() else ""
+        why_str = f" | why: {why_saved.strip()[:120]}" if why_saved and why_saved.strip() else ""
         exp = explicitness.strip().lower() if explicitness else "explicit"
         if exp not in {"explicit", "inferred"}:
             exp = "explicit"
@@ -223,7 +229,7 @@ class MemoryStore:
         conflict_str = f" | conflict: supersedes-{previous_count}" if conflict else ""
         entry = (
             f"\n\n## {title}\n"
-            f"*type: {memory_type} | saved: {now}{explicitness_str}{confidence_str}{source_str}{conflict_str}*\n\n"
+            f"*type: {memory_type} | saved: {now}{explicitness_str}{confidence_str}{source_str}{why_str}{conflict_str}*\n\n"
             f"{content.strip()}\n"
         )
 
@@ -248,6 +254,7 @@ class MemoryStore:
             explicitness=exp,
             session_id=session_id,
             tags=tags or [],
+            why_saved=why_saved,
         )
 
         return str(topic_file)
@@ -265,6 +272,7 @@ class MemoryStore:
         explicitness: str,
         session_id: str | None,
         tags: list[str],
+        why_saved: str | None,
     ) -> None:
         self.ensure_dir()
         log_path = self.structured_log_path(scope)
@@ -329,6 +337,7 @@ class MemoryStore:
             "confidence": confidence,
             "source": (source or "").strip(),
             "explicitness": explicitness,
+            "why_saved": (why_saved or "").strip(),
             "session_id": session_id or "",
             "tags": [t.strip().lower() for t in tags if t and t.strip()],
             "created_at": now,
@@ -336,6 +345,12 @@ class MemoryStore:
         }
         rows.append(record)
         self._write_structured_rows(scope, rows)
+
+    def append_audit_record(self, scope: str, record: dict[str, Any]) -> None:
+        self.ensure_dir()
+        p = self.audit_log_path(scope)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _record_key(*, memory_type: str, topic: str, title: str) -> str:
@@ -514,6 +529,7 @@ project context, or external references — save it using the `memory_save` tool
 
 ### Structured Query First
 When recalling specific prior decisions/preferences, prefer metadata-aware lookup via `memory_query` (e.g. by `session_id`, `memory_type`, or `tags`) before broad topic reads.
+When you need full-text recall across historical session messages, use `memory_search` (FTS5-backed lexical search with snippets).
 
 ### Current Memory Index
 {memory_content if memory_content else "(No memories saved yet.)"}
@@ -576,6 +592,15 @@ class MemoryExtension(Extension):
         self._block_cache: dict[tuple[str, int, tuple[tuple[str, int, int], ...]], str] = {}
         self._code_index_gate_enabled = os.getenv("TAU_MEMORY_CODE_INDEX_GATING", "1").strip().lower() not in {"0", "false", "no", "off"}
         self._last_code_index_stats: dict[str, Any] | None = None
+        self._session_db_path = os.getenv("TAU_STATE_DB_PATH", "").strip() or None
+        self._hybrid_session_enabled = os.getenv("TAU_MEMORY_HYBRID_SESSION", "0").strip().lower() not in {"0", "false", "no", "off"}
+        self._hybrid_session_limit = max(1, int(os.getenv("TAU_MEMORY_HYBRID_SESSION_LIMIT", "2")))
+        self._session_hits_cache: dict[str, list[dict[str, Any]]] = {}
+        self._write_policy_strict = os.getenv("TAU_MEMORY_WRITE_POLICY_STRICT", "0").strip().lower() not in {"0", "false", "no", "off"}
+        self._require_source = os.getenv("TAU_MEMORY_REQUIRE_SOURCE", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self._require_confidence = os.getenv("TAU_MEMORY_REQUIRE_CONFIDENCE", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self._require_why_saved = os.getenv("TAU_MEMORY_REQUIRE_WHY_SAVED", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self._min_confidence = max(0.0, min(1.0, float(os.getenv("TAU_MEMORY_MIN_CONFIDENCE", "0.35"))))
 
     _RETRIEVAL_START = "<!-- TAU_MEMORY_RETRIEVAL_START -->"
     _RETRIEVAL_END = "<!-- TAU_MEMORY_RETRIEVAL_END -->"
@@ -831,6 +856,58 @@ class MemoryExtension(Extension):
         }
         return final_score, why
 
+    def _collect_session_hits(self, query: str, limit: int) -> list[dict[str, Any]]:
+        if not self._hybrid_session_enabled:
+            return []
+        q = (query or "").strip()
+        if not q:
+            return []
+        cache_key = q.lower()
+        if cache_key in self._session_hits_cache:
+            return list(self._session_hits_cache[cache_key])
+        try:
+            from tau.core.state import SessionDB
+        except Exception:  # noqa: BLE001
+            return []
+
+        db_path = Path(self._session_db_path).expanduser().resolve() if self._session_db_path else None
+        db = SessionDB(db_path=db_path)
+        try:
+            rows = db.search_messages(
+                query=q,
+                limit=max(1, min(int(limit), self._hybrid_session_limit)),
+                offset=0,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            snippet = str(r.get("snippet", "")).strip()
+            # snippet may contain FTS highlight markers; keep it compact.
+            snippet = snippet.replace("\n", " ")
+            if not snippet:
+                continue
+            out.append(
+                {
+                    "session_id": str(r.get("session_id", "")),
+                    "source": str(r.get("source", "")),
+                    "role": str(r.get("role", "")),
+                    "snippet": snippet[:240],
+                    "timestamp": r.get("timestamp", ""),
+                }
+            )
+        # Keep tiny cache to avoid repeated FTS calls on near-identical turns.
+        if len(self._session_hits_cache) > 16:
+            self._session_hits_cache.clear()
+        self._session_hits_cache[cache_key] = list(out)
+        return out
+
     def _build_retrieval_block(self, query: str, topk: int) -> str:
         q = self._tokenize_query(query)
         if not q:
@@ -877,7 +954,25 @@ class MemoryExtension(Extension):
                 f"conflict_penalty={why.get('conflict_penalty', 0)}, "
                 f"score={why.get('final_score', 0)}"
             )
-            scored.append((score, f"- ({scope}) {title}: {body}\n  [{explain}]", why))
+            scored.append((score, f"- [memory:{scope}] {title}: {body}\n  [{explain}]", why))
+
+        # Hybrid path: include FTS session recalls from tau-core SessionDB.
+        # Keep scoring simple and deterministic, then merge with memory scores.
+        for hit in self._collect_session_hits(query, limit=max(1, min(self._hybrid_session_limit, topk * 2))):
+            hit_tokens = self._tokenize_query(hit.get("snippet", ""))
+            overlap = len(q & hit_tokens)
+            if overlap == 0:
+                continue
+            coverage = overlap / max(1, len(q))
+            score = (overlap * 0.75) + coverage + 0.25
+            sid = hit.get("session_id", "")
+            src = hit.get("source", "")
+            role = hit.get("role", "")
+            snippet = hit.get("snippet", "")
+            explain = f"why: overlap={overlap}, coverage={coverage:.3f}, score={score:.3f}"
+            line = f"- [session:{src}] ({role}) {sid}: {snippet}\n  [{explain}]"
+            scored.append((score, line, {"source": "session"}))
+
         if not scored:
             self._block_cache[cache_key] = ""
             return ""
@@ -992,6 +1087,11 @@ class MemoryExtension(Extension):
                         description="Optional tag list for structured memory retrieval.",
                         required=False,
                     ),
+                    "why_saved": ToolParameter(
+                        type="string",
+                        description="Why this memory is being saved now (decision rationale for audit).",
+                        required=False,
+                    ),
                 },
                 handler=self._handle_memory_save,
             ),
@@ -1084,6 +1184,45 @@ class MemoryExtension(Extension):
                 },
                 handler=self._handle_memory_extract_session,
             ),
+            ToolDefinition(
+                name="memory_search",
+                description=(
+                    "Full-text search across historical session messages (SQLite FTS5). "
+                    "Use this for cross-session recall when metadata filters are not enough."
+                ),
+                parameters={
+                    "query": ToolParameter(
+                        type="string",
+                        description="FTS query text to search in past session messages.",
+                    ),
+                    "source_filter": ToolParameter(
+                        type="array",
+                        description="Optional source filter list (e.g. cli, telegram, discord).",
+                        required=False,
+                    ),
+                    "role_filter": ToolParameter(
+                        type="array",
+                        description="Optional role filter list (user, assistant, tool).",
+                        required=False,
+                    ),
+                    "session_id": ToolParameter(
+                        type="string",
+                        description="Optional exact session ID filter on results.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum results to return (default 10).",
+                        required=False,
+                    ),
+                    "offset": ToolParameter(
+                        type="integer",
+                        description="Pagination offset (default 0).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_memory_search,
+            ),
         ]
 
     # ------------------------------------------------------------------
@@ -1128,12 +1267,55 @@ class MemoryExtension(Extension):
         explicitness: str = "explicit",
         session_id: str | None = None,
         tags: list[str] | None = None,
+        why_saved: str | None = None,
     ) -> str:
         if self._store is None:
             return "Error: Memory store not initialized."
 
         if memory_type not in MEMORY_TYPES:
             return f"Error: Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}"
+
+        scope = "global" if memory_type in GLOBAL_MEMORY_TYPES else "local"
+        violations: list[str] = []
+        if self._require_source and not (source and str(source).strip()):
+            violations.append("missing required field: source")
+        if self._require_why_saved and not (why_saved and str(why_saved).strip()):
+            violations.append("missing required field: why_saved")
+        if self._require_confidence:
+            if confidence is None:
+                violations.append("missing required field: confidence")
+            else:
+                try:
+                    c = float(confidence)
+                    if c < self._min_confidence:
+                        violations.append(f"confidence {c:.2f} below minimum {self._min_confidence:.2f}")
+                except Exception:  # noqa: BLE001
+                    violations.append("confidence is not a valid number")
+
+        decision = "allow"
+        if violations and self._write_policy_strict:
+            decision = "deny"
+        elif violations:
+            decision = "allow_with_warnings"
+        self._store.append_audit_record(
+            scope=scope,
+            record={
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "action": "memory_save",
+                "decision": decision,
+                "violations": violations,
+                "memory_type": memory_type,
+                "title": title,
+                "session_id": session_id or "",
+                "source": (source or "").strip(),
+                "confidence": confidence,
+                "explicitness": explicitness,
+                "why_saved": (why_saved or "").strip(),
+                "tags": [t.strip().lower() for t in (tags or []) if t and t.strip()],
+            },
+        )
+        if decision == "deny":
+            return "Error: memory write denied by policy: " + "; ".join(violations)
 
         try:
             path = self._store.save_memory(
@@ -1146,7 +1328,10 @@ class MemoryExtension(Extension):
                 explicitness=explicitness,
                 session_id=session_id,
                 tags=tags,
+                why_saved=why_saved,
             )
+            if violations:
+                return f"Memory saved with policy warnings: '{title}' → {path} ({'; '.join(violations)})"
             return f"Memory saved: '{title}' → {path}"
         except Exception as e:
             return f"Error saving memory: {e}"
@@ -1208,7 +1393,64 @@ class MemoryExtension(Extension):
             explicitness="inferred",
             session_id=session_id,
             tags=tags or ["session"],
+            confidence=0.5,
+            why_saved="session extract from recent conversation",
         )
+
+    def _handle_memory_search(
+        self,
+        query: str,
+        source_filter: list[str] | None = None,
+        role_filter: list[str] | None = None,
+        session_id: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> str:
+        q = (query or "").strip()
+        if not q:
+            return "Error: query is required."
+
+        try:
+            from tau.core.state import SessionDB
+        except Exception as e:  # noqa: BLE001
+            return f"Error: session search backend unavailable: {e}"
+
+        db_path = Path(self._session_db_path).expanduser().resolve() if self._session_db_path else None
+        db = SessionDB(db_path=db_path)
+        try:
+            rows = db.search_messages(
+                query=q,
+                source_filter=source_filter or None,
+                role_filter=role_filter or None,
+                limit=max(1, int(limit)),
+                offset=max(0, int(offset)),
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"Error running memory_search: {e}"
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if session_id:
+            rows = [r for r in rows if str(r.get("session_id", "")) == session_id]
+
+        if not rows:
+            return "No session messages matched."
+
+        out = [
+            "| session_id | source | role | snippet | timestamp |",
+            "|------------|--------|------|---------|-----------|",
+        ]
+        for r in rows:
+            sid = str(r.get("session_id", ""))
+            src = str(r.get("source", ""))
+            role = str(r.get("role", ""))
+            snippet = str(r.get("snippet", "")).replace("\n", " ").strip()
+            ts = str(r.get("timestamp", ""))
+            out.append(f"| {sid} | {src} | {role} | {snippet[:140]} | {ts} |")
+        return "\n".join(out)
 
     def _handle_memory_read(self, topic: str) -> str:
         if self._store is None:
