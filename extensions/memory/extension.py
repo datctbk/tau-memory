@@ -663,6 +663,13 @@ class MemoryExtension(Extension):
             )
         self._inject_fragment(context, fragment)
         logger.debug("Memory: topk=%d, retrieval_budget=%d", self._topk, self._retrieval_token_budget)
+        self._log_ops(
+            scope="local",
+            event="memory_extension_loaded",
+            topk=self._topk,
+            retrieval_budget=self._retrieval_token_budget,
+            hybrid_session_enabled=self._hybrid_session_enabled,
+        )
 
     def before_turn(self, user_input: str) -> None:
         if self._store is None or self._topk <= 0:
@@ -683,6 +690,13 @@ class MemoryExtension(Extension):
         )
 
     def _log_ops(self, *, scope: str, event: str, **data: Any) -> None:
+        # Also emit into tau --trace-log stream when enabled.
+        try:
+            from tau.core import trace as _trace
+            if _trace.is_enabled():
+                _trace.log_extension_event("memory", event, data)
+        except Exception:  # noqa: BLE001
+            pass
         if not self._ops_log_enabled or self._store is None:
             return
         try:
@@ -694,13 +708,6 @@ class MemoryExtension(Extension):
                     **data,
                 },
             )
-        except Exception:  # noqa: BLE001
-            pass
-        # Also emit into tau --trace-log stream when enabled.
-        try:
-            from tau.core import trace as _trace
-            if _trace.is_enabled():
-                _trace.log_extension_event("memory", event, data)
         except Exception:  # noqa: BLE001
             pass
 
