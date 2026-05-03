@@ -251,6 +251,24 @@ class TestMemorySaveHandler:
         assert "deny" in decisions
         assert "allow" in decisions
 
+    def test_ops_log_written_for_memory_save(self, ext_with_store, tmp_path):
+        ext, _, _ = ext_with_store
+        ext._ops_log_enabled = True
+        ext._write_policy_strict = False
+        out = ext._handle_memory_save(
+            title="Ops log test",
+            content="important memory",
+            memory_type="project",
+            source="user-explicit",
+            confidence=0.9,
+            why_saved="user asked to remember this",
+        )
+        assert "saved" in out.lower()
+        p = tmp_path / ".tau" / "memory" / "memory_ops.jsonl"
+        assert p.is_file()
+        rows = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert any(r.get("event") == "memory_save_allowed" for r in rows)
+
 
 # ---------------------------------------------------------------------------
 # memory_read handler

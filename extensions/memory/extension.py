@@ -61,6 +61,7 @@ MEMORY_TYPES = ("user", "feedback", "project", "reference")
 GLOBAL_MEMORY_TYPES = {"user", "feedback"}
 STRUCTURED_LOG_NAME = "memory_records.jsonl"
 AUDIT_LOG_NAME = "memory_audit.jsonl"
+OPS_LOG_NAME = "memory_ops.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,9 @@ class MemoryStore:
 
     def audit_log_path(self, scope: str = "local") -> Path:
         return self._scope_root(scope) / AUDIT_LOG_NAME
+
+    def ops_log_path(self, scope: str = "local") -> Path:
+        return self._scope_root(scope) / OPS_LOG_NAME
 
     def exists(self, scope: str = "local") -> bool:
         path = self.global_entrypoint if scope == "global" else self.entrypoint
@@ -349,6 +353,12 @@ class MemoryStore:
     def append_audit_record(self, scope: str, record: dict[str, Any]) -> None:
         self.ensure_dir()
         p = self.audit_log_path(scope)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def append_ops_record(self, scope: str, record: dict[str, Any]) -> None:
+        self.ensure_dir()
+        p = self.ops_log_path(scope)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -601,6 +611,7 @@ class MemoryExtension(Extension):
         self._require_confidence = os.getenv("TAU_MEMORY_REQUIRE_CONFIDENCE", "1").strip().lower() not in {"0", "false", "no", "off"}
         self._require_why_saved = os.getenv("TAU_MEMORY_REQUIRE_WHY_SAVED", "1").strip().lower() not in {"0", "false", "no", "off"}
         self._min_confidence = max(0.0, min(1.0, float(os.getenv("TAU_MEMORY_MIN_CONFIDENCE", "0.35"))))
+        self._ops_log_enabled = os.getenv("TAU_MEMORY_OPS_LOG", "1").strip().lower() not in {"0", "false", "no", "off"}
 
     _RETRIEVAL_START = "<!-- TAU_MEMORY_RETRIEVAL_START -->"
     _RETRIEVAL_END = "<!-- TAU_MEMORY_RETRIEVAL_END -->"
@@ -656,8 +667,42 @@ class MemoryExtension(Extension):
     def before_turn(self, user_input: str) -> None:
         if self._store is None or self._topk <= 0:
             return
+        self._log_ops(
+            scope="local",
+            event="before_turn_start",
+            query=(user_input or "")[:160],
+            topk=self._topk,
+        )
         block = self._build_retrieval_block(user_input, topk=self._topk)
         self._upsert_retrieval_fragment(block)
+        self._log_ops(
+            scope="local",
+            event="before_turn_end",
+            retrieved=bool(block),
+            block_chars=len(block),
+        )
+
+    def _log_ops(self, *, scope: str, event: str, **data: Any) -> None:
+        if not self._ops_log_enabled or self._store is None:
+            return
+        try:
+            self._store.append_ops_record(
+                scope=scope,
+                record={
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "event": event,
+                    **data,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # Also emit into tau --trace-log stream when enabled.
+        try:
+            from tau.core import trace as _trace
+            if _trace.is_enabled():
+                _trace.log_extension_event("memory", event, data)
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -683,6 +728,8 @@ class MemoryExtension(Extension):
                 if f.suffix not in {".md", ".jsonl"}:
                     continue
                 if f.name == ENTRYPOINT_NAME:
+                    continue
+                if f.name in {AUDIT_LOG_NAME, OPS_LOG_NAME}:
                     continue
                 try:
                     st = f.stat()
@@ -864,6 +911,7 @@ class MemoryExtension(Extension):
             return []
         cache_key = q.lower()
         if cache_key in self._session_hits_cache:
+            self._log_ops(scope="local", event="session_hits_cache_hit", query=cache_key)
             return list(self._session_hits_cache[cache_key])
         try:
             from tau.core.state import SessionDB
@@ -906,6 +954,7 @@ class MemoryExtension(Extension):
         if len(self._session_hits_cache) > 16:
             self._session_hits_cache.clear()
         self._session_hits_cache[cache_key] = list(out)
+        self._log_ops(scope="local", event="session_hits_fetched", query=cache_key, hits=len(out))
         return out
 
     def _build_retrieval_block(self, query: str, topk: int) -> str:
@@ -929,6 +978,7 @@ class MemoryExtension(Extension):
         cache_key = (query.strip().lower(), int(topk), current_snapshot)
         cached = self._block_cache.get(cache_key)
         if cached is not None:
+            self._log_ops(scope="local", event="retrieval_block_cache_hit", query=query.strip().lower(), topk=int(topk))
             return cached
         min_score = float(os.getenv("TAU_MEMORY_RETRIEVAL_MIN_SCORE", "1.2"))
         scored: list[tuple[float, str, dict[str, Any]]] = []
@@ -975,6 +1025,7 @@ class MemoryExtension(Extension):
 
         if not scored:
             self._block_cache[cache_key] = ""
+            self._log_ops(scope="local", event="retrieval_block_empty", query=query.strip().lower())
             return ""
         scored.sort(key=lambda x: x[0], reverse=True)
         selected: list[str] = []
@@ -990,9 +1041,11 @@ class MemoryExtension(Extension):
             used += cost
         if not selected:
             self._block_cache[cache_key] = ""
+            self._log_ops(scope="local", event="retrieval_block_budget_skip", query=query.strip().lower(), candidates=len(scored))
             return ""
         block = "Relevant memory for this turn:\n" + "\n".join(selected)
         self._block_cache[cache_key] = block
+        self._log_ops(scope="local", event="retrieval_block_built", query=query.strip().lower(), selected=len(selected), candidates=len(scored))
         return block
 
     def _upsert_retrieval_fragment(self, block: str) -> None:
@@ -1315,6 +1368,7 @@ class MemoryExtension(Extension):
             },
         )
         if decision == "deny":
+            self._log_ops(scope=scope, event="memory_save_denied", title=title, memory_type=memory_type, violations=violations)
             return "Error: memory write denied by policy: " + "; ".join(violations)
 
         try:
@@ -1331,9 +1385,12 @@ class MemoryExtension(Extension):
                 why_saved=why_saved,
             )
             if violations:
+                self._log_ops(scope=scope, event="memory_save_allowed_with_warnings", title=title, memory_type=memory_type, path=path, violations=violations)
                 return f"Memory saved with policy warnings: '{title}' → {path} ({'; '.join(violations)})"
+            self._log_ops(scope=scope, event="memory_save_allowed", title=title, memory_type=memory_type, path=path)
             return f"Memory saved: '{title}' → {path}"
         except Exception as e:
+            self._log_ops(scope=scope, event="memory_save_error", title=title, memory_type=memory_type, error=str(e))
             return f"Error saving memory: {e}"
 
     def _handle_memory_query(
@@ -1356,7 +1413,9 @@ class MemoryExtension(Extension):
             limit=limit,
         )
         if not rows:
+            self._log_ops(scope=scope or "local", event="memory_query_empty", scope_filter=scope, memory_type=memory_type, topic=topic, session_id=session_id, limit=limit)
             return "No structured memory records matched."
+        self._log_ops(scope=scope or "local", event="memory_query_ok", scope_filter=scope, memory_type=memory_type, topic=topic, session_id=session_id, limit=limit, count=len(rows))
         lines = [
             "| id | scope | type | topic | session | title | tags |",
             "|----|-------|------|-------|---------|-------|------|",
@@ -1437,7 +1496,9 @@ class MemoryExtension(Extension):
             rows = [r for r in rows if str(r.get("session_id", "")) == session_id]
 
         if not rows:
+            self._log_ops(scope="local", event="memory_search_empty", query=q, limit=limit, offset=offset)
             return "No session messages matched."
+        self._log_ops(scope="local", event="memory_search_ok", query=q, limit=limit, offset=offset, count=len(rows))
 
         out = [
             "| session_id | source | role | snippet | timestamp |",
