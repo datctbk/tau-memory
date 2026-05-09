@@ -605,6 +605,8 @@ class MemoryExtension(Extension):
         self._session_db_path = os.getenv("TAU_STATE_DB_PATH", "").strip() or None
         self._hybrid_session_enabled = os.getenv("TAU_MEMORY_HYBRID_SESSION", "0").strip().lower() not in {"0", "false", "no", "off"}
         self._hybrid_session_limit = max(1, int(os.getenv("TAU_MEMORY_HYBRID_SESSION_LIMIT", "2")))
+        self._hybrid_session_snippet_chars = max(80, int(os.getenv("TAU_MEMORY_HYBRID_SESSION_SNIPPET_CHARS", "160")))
+        self._hybrid_session_inject_limit = max(1, int(os.getenv("TAU_MEMORY_HYBRID_SESSION_INJECT_LIMIT", "3")))
         self._session_hits_cache: dict[str, list[dict[str, Any]]] = {}
         self._write_policy_strict = os.getenv("TAU_MEMORY_WRITE_POLICY_STRICT", "0").strip().lower() not in {"0", "false", "no", "off"}
         self._require_source = os.getenv("TAU_MEMORY_REQUIRE_SOURCE", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -953,7 +955,7 @@ class MemoryExtension(Extension):
                     "session_id": str(r.get("session_id", "")),
                     "source": str(r.get("source", "")),
                     "role": str(r.get("role", "")),
-                    "snippet": snippet[:240],
+                    "snippet": snippet[: self._hybrid_session_snippet_chars],
                     "timestamp": r.get("timestamp", ""),
                 }
             )
@@ -968,6 +970,9 @@ class MemoryExtension(Extension):
         q = self._tokenize_query(query)
         if not q:
             return ""
+        structured_candidates = 0
+        session_candidates = 0
+        session_injected = 0
         # Gating: if code index reports no changed files and we already have
         # parsed entries cached, avoid maintenance refresh work.
         if self._code_index_gate_enabled and self._entries_cache_rows and not self._code_index_has_changes():
@@ -1002,6 +1007,7 @@ class MemoryExtension(Extension):
             )
             if score < min_score:
                 continue
+            structured_candidates += 1
             scope = str(row.get("scope", "local"))
             title = str(row.get("title", ""))
             body = str(row.get("body", ""))
@@ -1015,11 +1021,15 @@ class MemoryExtension(Extension):
 
         # Hybrid path: include FTS session recalls from tau-core SessionDB.
         # Keep scoring simple and deterministic, then merge with memory scores.
+        session_added = 0
         for hit in self._collect_session_hits(query, limit=max(1, min(self._hybrid_session_limit, topk * 2))):
+            if session_added >= self._hybrid_session_inject_limit:
+                break
             hit_tokens = self._tokenize_query(hit.get("snippet", ""))
             overlap = len(q & hit_tokens)
             if overlap == 0:
                 continue
+            session_candidates += 1
             coverage = overlap / max(1, len(q))
             score = (overlap * 0.75) + coverage + 0.25
             sid = hit.get("session_id", "")
@@ -1029,6 +1039,8 @@ class MemoryExtension(Extension):
             explain = f"why: overlap={overlap}, coverage={coverage:.3f}, score={score:.3f}"
             line = f"- [session:{src}] ({role}) {sid}: {snippet}\n  [{explain}]"
             scored.append((score, line, {"source": "session"}))
+            session_added += 1
+            session_injected += 1
 
         if not scored:
             self._block_cache[cache_key] = ""
@@ -1052,6 +1064,19 @@ class MemoryExtension(Extension):
             return ""
         block = "Relevant memory for this turn:\n" + "\n".join(selected)
         self._block_cache[cache_key] = block
+        self._log_ops(
+            scope="local",
+            event="retrieval_context_composition",
+            query=query.strip().lower(),
+            topk=int(topk),
+            structured_candidates=int(structured_candidates),
+            session_candidates=int(session_candidates),
+            session_injected=int(session_injected),
+            selected=int(len(selected)),
+            token_budget=int(self._retrieval_token_budget),
+            tokens_used=int(used),
+            block_chars=int(len(block)),
+        )
         self._log_ops(scope="local", event="retrieval_block_built", query=query.strip().lower(), selected=len(selected), candidates=len(scored))
         return block
 
