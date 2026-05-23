@@ -26,12 +26,18 @@ import hashlib
 import logging
 import math
 import os
+import sys
 import re
 import time
 from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+# Dynamic sys.path insert to support loading local modules without relative import errors
+_ext_dir = str(Path(__file__).parent)
+if _ext_dir not in sys.path:
+    sys.path.insert(0, _ext_dir)
 
 from tau.core.extension import Extension, ExtensionContext
 from tau.core.types import (
@@ -672,6 +678,134 @@ class MemoryExtension(Extension):
             retrieval_budget=self._retrieval_token_budget,
             hybrid_session_enabled=self._hybrid_session_enabled,
         )
+
+        try:
+            from tau.core.rehydrate import register_rehydrate_provider
+            from tau.core.code_index import register_index_listener
+
+            register_rehydrate_provider(self._rehydrate_context)
+            register_index_listener(self._index_listener)
+        except Exception as exc:
+            logger.warning("Failed to register semantic search provider/listener: %s", exc)
+
+    def on_unload(self) -> None:
+        try:
+            from tau.core.rehydrate import unregister_rehydrate_provider
+            from tau.core.code_index import unregister_index_listener
+
+            unregister_rehydrate_provider(self._rehydrate_context)
+            unregister_index_listener(self._index_listener)
+        except Exception:
+            pass
+
+    def _index_listener(self, workspace_root: Path, changes: Any, stats: dict[str, Any]) -> None:
+        # Index changes in semantic store
+        if os.getenv("TAU_SEMANTIC_STORE_ENABLED", "1") != "0":
+            try:
+                from semantic_pipeline import ingest_workspace_changes
+                stats["semantic_store"] = ingest_workspace_changes(
+                    workspace_root,
+                    changes,
+                    model=os.getenv("TAU_SEMANTIC_MODEL", "local-hash-v1"),
+                    db_path=os.getenv("TAU_SEMANTIC_STORE_DB_PATH"),
+                )
+            except Exception as exc:
+                logger.warning("Failed to run semantic index update: %s", exc)
+
+        # Collect embedding cache stats if enabled
+        if os.getenv("TAU_EMBEDDING_CACHE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                from embedding_cache import EmbeddingCache
+                from tau.core.chunker import chunk_file
+                
+                model = os.getenv("TAU_EMBEDDING_CACHE_MODEL", "default")
+                cache_db_path = os.getenv("TAU_EMBEDDING_CACHE_DB_PATH")
+                cache = EmbeddingCache(db_path=Path(cache_db_path) if cache_db_path else None)
+                
+                chunk_count = 0
+                cache_hit = 0
+                cache_miss = 0
+                try:
+                    for rel in changes.changed:
+                        p = workspace_root / rel
+                        if not p.is_file():
+                            continue
+                        try:
+                            text = p.read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            continue
+                        chunks = chunk_file(rel, text)
+                        chunk_count += len(chunks)
+                        for c in chunks:
+                            got = cache.get(c.content_hash, model)
+                            if got is None:
+                                cache_miss += 1
+                            else:
+                                cache_hit += 1
+                finally:
+                    cache.close()
+                stats["embedding_cache"] = {
+                    "model": model,
+                    "chunk_count": chunk_count,
+                    "cache_hit": cache_hit,
+                    "cache_miss": cache_miss,
+                    "recomputed_chunks": cache_miss,
+                }
+            except Exception as exc:
+                logger.warning("Failed to collect embedding cache stats: %s", exc)
+
+    def _rehydrate_context(
+        self,
+        query: str,
+        workspace_root: Path,
+        max_chunks: int,
+        max_chars_per_chunk: int,
+        max_total_chars: int,
+    ) -> str:
+        try:
+            from semantic_store import SemanticStore
+            from semantic_pipeline import embed_text_local_hash, semantic_model_name
+            
+            store = SemanticStore(db_path=Path(os.getenv("TAU_SEMANTIC_STORE_DB_PATH")) if os.getenv("TAU_SEMANTIC_STORE_DB_PATH") else None)
+            try:
+                qv = embed_text_local_hash(query)
+                hits = store.hybrid_search(
+                    query=query,
+                    query_vector=qv,
+                    model=semantic_model_name(),
+                    limit=max(max_chunks * 3, 20),
+                    lexical_weight=float(os.getenv("TAU_SEMANTIC_LEXICAL_WEIGHT", "0.45")),
+                    semantic_weight=float(os.getenv("TAU_SEMANTIC_VECTOR_WEIGHT", "0.55")),
+                )
+            finally:
+                store.close()
+            if not hits:
+                return ""
+                
+            lines = ["Rehydrated Code Context (hybrid lexical+semantic, post-compaction):"]
+            used = len(lines[0])
+            selected = 0
+            for h in hits:
+                snippet = h.snippet or ""
+                if len(snippet) > max_chars_per_chunk:
+                    snippet = snippet[:max_chars_per_chunk].rstrip() + "\n...[truncated]"
+                header = (
+                    f"- {h.path}:{h.start_line}-{h.end_line} "
+                    f"(score={h.score:.3f}, lex={h.lexical_score:.3f}, sem={h.semantic_score:.3f})"
+                )
+                block = f"{header}\n```text\n{snippet}\n```"
+                cost = len(block) + 2
+                if used + cost > max_total_chars:
+                    break
+                lines.append(block)
+                used += cost
+                selected += 1
+                if selected >= max_chunks:
+                    break
+            return "" if selected == 0 else "\n\n".join(lines)
+        except Exception as exc:
+            logger.warning("Failed to build semantic rehydrate block: %s", exc)
+            return ""
 
     def before_turn(self, user_input: str) -> None:
         if self._store is None or self._topk <= 0:

@@ -650,7 +650,8 @@ class TestTopKRetrieval:
         assert "conflict_penalty=" in block
         assert "score=" in block
 
-    def test_retrieval_cache_uses_cached_block_and_invalidates_on_file_change(self, tmp_path):
+    def test_retrieval_cache_uses_cached_block_and_invalidates_on_file_change(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TAU_MEMORY_GLOBAL_DIR", str(tmp_path / "global-mem"))
         ext = MemoryExtension()
 
         class _Inner:
