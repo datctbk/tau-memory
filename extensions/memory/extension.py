@@ -1220,6 +1220,21 @@ class MemoryExtension(Extension):
         inner = getattr(self._ext_context, "_context", None)
         if inner is None:
             return
+
+        builder = getattr(inner, "prompt_builder", None)
+        if builder is not None:
+            if block:
+                builder.add_fragment("memory_retrieval", block, priority=55)
+            else:
+                builder.remove_fragment("memory_retrieval")
+            update_fn = getattr(inner, "_update_system_message", None)
+            if update_fn:
+                try:
+                    update_fn()
+                except Exception:
+                    pass
+            return
+
         messages = getattr(inner, "_messages", None)
         if not isinstance(messages, list):
             return
