@@ -103,15 +103,15 @@ class TestToolsRegistration:
 # ---------------------------------------------------------------------------
 
 class TestSlashCommands:
-    def test_registers_two_commands(self, ext_with_store):
+    def test_registers_three_commands(self, ext_with_store):
         ext, _, _ = ext_with_store
         cmds = ext.slash_commands()
-        assert len(cmds) == 2
+        assert len(cmds) == 3
 
     def test_command_names(self, ext_with_store):
         ext, _, _ = ext_with_store
         names = {c.name for c in ext.slash_commands()}
-        assert names == {"memory", "dream"}
+        assert names == {"memory", "dream", "reindex"}
 
     def test_handle_memory(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store
@@ -120,6 +120,12 @@ class TestSlashCommands:
     def test_handle_dream(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store
         assert ext.handle_slash("dream", "", ctx_mock) is True
+
+    def test_handle_reindex(self, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        # Thread will run so let's mock it if needed or test handle_slash returns True
+        with patch("threading.Thread") as mock_thread:
+            assert ext.handle_slash("reindex", "", ctx_mock) is True
 
     def test_handle_unknown(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store
@@ -455,6 +461,16 @@ class TestMemoryStatus:
         
         args, kwargs = ctx_mock.print.call_args_list[0]
         assert "background" in args[0].lower()
+
+    @patch("threading.Thread")
+    def test_reindex_trigger(self, mock_thread, ext_with_store, ctx_mock):
+        ext, _, _ = ext_with_store
+        ext.handle_slash("reindex", "", ctx_mock)
+        mock_thread.assert_called_once()
+        mock_thread.return_value.start.assert_called_once()
+        
+        args, kwargs = ctx_mock.print.call_args_list[0]
+        assert "started" in args[0].lower()
 
     def test_status_no_memories(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store

@@ -699,60 +699,8 @@ class MemoryExtension(Extension):
             pass
 
     def _index_listener(self, workspace_root: Path, changes: Any, stats: dict[str, Any]) -> None:
-        # Index changes in semantic store
-        if os.getenv("TAU_SEMANTIC_STORE_ENABLED", "1") != "0":
-            try:
-                from semantic_pipeline import ingest_workspace_changes
-                stats["semantic_store"] = ingest_workspace_changes(
-                    workspace_root,
-                    changes,
-                    model=os.getenv("TAU_SEMANTIC_MODEL", "local-hash-v1"),
-                    db_path=os.getenv("TAU_SEMANTIC_STORE_DB_PATH"),
-                )
-            except Exception as exc:
-                logger.warning("Failed to run semantic index update: %s", exc)
-
-        # Collect embedding cache stats if enabled
-        if os.getenv("TAU_EMBEDDING_CACHE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-            try:
-                from embedding_cache import EmbeddingCache
-                from tau.core.chunker import chunk_file
-                
-                model = os.getenv("TAU_EMBEDDING_CACHE_MODEL", "default")
-                cache_db_path = os.getenv("TAU_EMBEDDING_CACHE_DB_PATH")
-                cache = EmbeddingCache(db_path=Path(cache_db_path) if cache_db_path else None)
-                
-                chunk_count = 0
-                cache_hit = 0
-                cache_miss = 0
-                try:
-                    for rel in changes.changed:
-                        p = workspace_root / rel
-                        if not p.is_file():
-                            continue
-                        try:
-                            text = p.read_text(encoding="utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        chunks = chunk_file(rel, text)
-                        chunk_count += len(chunks)
-                        for c in chunks:
-                            got = cache.get(c.content_hash, model)
-                            if got is None:
-                                cache_miss += 1
-                            else:
-                                cache_hit += 1
-                finally:
-                    cache.close()
-                stats["embedding_cache"] = {
-                    "model": model,
-                    "chunk_count": chunk_count,
-                    "cache_hit": cache_hit,
-                    "cache_miss": cache_miss,
-                    "recomputed_chunks": cache_miss,
-                }
-            except Exception as exc:
-                logger.warning("Failed to collect embedding cache stats: %s", exc)
+        # Code indexing is now handled exclusively by the codegraph extension (Strategy A)
+        pass
 
     def _rehydrate_context(
         self,
@@ -763,35 +711,118 @@ class MemoryExtension(Extension):
         max_total_chars: int,
     ) -> str:
         try:
-            from semantic_store import SemanticStore
-            from semantic_pipeline import embed_text_local_hash, semantic_model_name
+            import sqlite3
+            import json
+            import math
             
-            store = SemanticStore(db_path=Path(os.getenv("TAU_SEMANTIC_STORE_DB_PATH")) if os.getenv("TAU_SEMANTIC_STORE_DB_PATH") else None)
+            db_path = workspace_root / ".codegraph" / "codegraph.db"
+            if not db_path.is_file():
+                logger.debug("Codegraph DB not found for rehydration: %s", db_path)
+                return ""
+
+            # Define embed_text_local_hash helper inside the method
+            def _tokenize_text(text: str) -> list[str]:
+                return [x for x in re.findall(r"[a-z0-9_]+", (text or "").lower()) if len(x) >= 2]
+
+            def _embed_text(text: str, dim: int = 256) -> list[float]:
+                vec = [0.0] * dim
+                toks = _tokenize_text(text)
+                if not toks:
+                    return vec
+                for t in toks:
+                    h = hash(t)
+                    idx = abs(h) % dim
+                    sign = -1.0 if (h & 1) else 1.0
+                    vec[idx] += sign
+                norm = math.sqrt(sum(v * v for v in vec))
+                if norm <= 0.0:
+                    return vec
+                return [v / norm for v in vec]
+                
+            qv = _embed_text(query)
+            
+            # Connect to codegraph db
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            conn.row_factory = sqlite3.Row
             try:
-                qv = embed_text_local_hash(query)
-                hits = store.hybrid_search(
-                    query=query,
-                    query_vector=qv,
-                    model=semantic_model_name(),
-                    limit=max(max_chunks * 3, 20),
-                    lexical_weight=float(os.getenv("TAU_SEMANTIC_LEXICAL_WEIGHT", "0.45")),
-                    semantic_weight=float(os.getenv("TAU_SEMANTIC_VECTOR_WEIGHT", "0.55")),
-                )
+                rows = conn.execute(
+                    """
+                    SELECT n.id, n.file_path, n.start_line, n.end_line, n.content, v.vector_json
+                    FROM nodes n
+                    JOIN node_vectors v ON v.node_id = n.id
+                    WHERE v.model = ? AND n.content IS NOT NULL
+                    """,
+                    ("local-hash-v1",),
+                ).fetchall()
             finally:
-                store.close()
-            if not hits:
+                conn.close()
+                
+            if not rows:
                 return ""
                 
+            # Helper for cosine similarity
+            def _cosine(a: list[float], b: list[float]) -> float:
+                if len(a) != len(b) or not a:
+                    return 0.0
+                dot = sum(x * y for x, y in zip(a, b))
+                na = math.sqrt(sum(x * x for x in a))
+                nb = math.sqrt(sum(y * y for y in b))
+                if na == 0.0 or nb == 0.0:
+                    return 0.0
+                return dot / (na * nb)
+                
+            # Helper for simple token matching score (lexical)
+            q_tokens = {w for w in _tokenize_text(query)}
+            
+            scored_hits = []
+            for r in rows:
+                content = r["content"] or ""
+                vector_json = r["vector_json"]
+                try:
+                    vec = [float(x) for x in json.loads(vector_json)]
+                except Exception:
+                    continue
+                    
+                # Semantic score
+                sem_score = _cosine(qv, vec)
+                
+                # Lexical score
+                c_tokens = {w for w in _tokenize_text(content)}
+                overlap = len(q_tokens & c_tokens)
+                lex_score = 1.0 / (1.0 + max(0.0, float(overlap))) if overlap > 0 else 0.0
+                
+                # Hybrid score (45% lexical, 55% semantic)
+                score = 0.45 * lex_score + 0.55 * sem_score
+                
+                scored_hits.append({
+                    "path": r["file_path"],
+                    "start_line": r["start_line"],
+                    "end_line": r["end_line"],
+                    "snippet": content,
+                    "score": score,
+                    "lex": lex_score,
+                    "sem": sem_score,
+                })
+                
+            # Sort and select top hits
+            scored_hits.sort(key=lambda x: x["score"], reverse=True)
+            hits = scored_hits[:max(max_chunks * 3, 20)]
+            
             lines = ["Rehydrated Code Context (hybrid lexical+semantic, post-compaction):"]
             used = len(lines[0])
             selected = 0
             for h in hits:
-                snippet = h.snippet or ""
+                snippet = h["snippet"] or ""
+                try:
+                    rel_path = Path(h["path"]).relative_to(workspace_root).as_posix()
+                except Exception:
+                    rel_path = h["path"]
+                    
                 if len(snippet) > max_chars_per_chunk:
                     snippet = snippet[:max_chars_per_chunk].rstrip() + "\n...[truncated]"
                 header = (
-                    f"- {h.path}:{h.start_line}-{h.end_line} "
-                    f"(score={h.score:.3f}, lex={h.lexical_score:.3f}, sem={h.semantic_score:.3f})"
+                    f"- {rel_path}:{h['start_line']}-{h['end_line']} "
+                    f"(score={h['score']:.3f}, lex={h['lex']:.3f}, sem={h['sem']:.3f})"
                 )
                 block = f"{header}\n```text\n{snippet}\n```"
                 cost = len(block) + 2
@@ -1457,6 +1488,105 @@ class MemoryExtension(Extension):
                 },
                 handler=self._handle_memory_search,
             ),
+            # ----------------------------------------------------------
+            # Codegraph query tools — let the LLM query the code index
+            # ----------------------------------------------------------
+            ToolDefinition(
+                name="codegraph_search",
+                description=(
+                    "Search the codebase index for symbols (functions, classes, variables, imports) "
+                    "by name or keyword. Returns matching symbol definitions with file paths and code snippets. "
+                    "Use this FIRST when the user asks about a symbol, class, function, or code concept. "
+                    "This searches the pre-built code graph index (much faster and more accurate than grep)."
+                ),
+                parameters={
+                    "query": ToolParameter(
+                        type="string",
+                        description="Search query — a symbol name, keyword, or partial name (e.g. 'KnowledgeGraphMCP', 'parse', 'auth').",
+                    ),
+                    "kind": ToolParameter(
+                        type="string",
+                        description="Optional filter by symbol kind: function, class, variable, import, module, method, decorator.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum results to return (default 20, max 50).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_search,
+            ),
+            ToolDefinition(
+                name="codegraph_get_symbol",
+                description=(
+                    "Get the full source code definition of a specific symbol (class, function, variable). "
+                    "Returns the complete code content, file path, line range, and metadata. "
+                    "Use this when you need to read the actual implementation of a known symbol."
+                ),
+                parameters={
+                    "name": ToolParameter(
+                        type="string",
+                        description="Exact symbol name to look up (e.g. 'KnowledgeGraphMCP', 'build_rehydrate_block').",
+                    ),
+                    "file_path": ToolParameter(
+                        type="string",
+                        description="Optional file path filter to disambiguate symbols with the same name.",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_get_symbol,
+            ),
+            ToolDefinition(
+                name="codegraph_get_callers",
+                description=(
+                    "Find all symbols that CALL or REFERENCE a target symbol. "
+                    "Use this for impact analysis — to see what depends on a function/class before refactoring. "
+                    "Returns caller names, file paths, and relationship types."
+                ),
+                parameters={
+                    "name": ToolParameter(
+                        type="string",
+                        description="Target symbol name to find callers of.",
+                    ),
+                    "file_path": ToolParameter(
+                        type="string",
+                        description="Optional file path filter to disambiguate.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum results (default 20, max 50).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_get_callers,
+            ),
+            ToolDefinition(
+                name="codegraph_get_callees",
+                description=(
+                    "Find all symbols that a target symbol CALLS or DEPENDS ON. "
+                    "Use this to understand what a function relies on — trace its dependencies. "
+                    "Returns callee names, file paths, and relationship types."
+                ),
+                parameters={
+                    "name": ToolParameter(
+                        type="string",
+                        description="Target symbol name to find callees of.",
+                    ),
+                    "file_path": ToolParameter(
+                        type="string",
+                        description="Optional file path filter to disambiguate.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum results (default 20, max 50).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_get_callees,
+            ),
         ]
 
     # ------------------------------------------------------------------
@@ -1475,6 +1605,16 @@ class MemoryExtension(Extension):
                 description="Trigger memory consolidation — review and clean up memories.",
                 usage="/dream",
             ),
+            SlashCommand(
+                name="reindex",
+                description="Reindex codebase symbols and update embeddings.",
+                usage="/reindex",
+            ),
+            SlashCommand(
+                name="stats",
+                description="Show codegraph index statistics (nodes, edges, languages).",
+                usage="/stats",
+            ),
         ]
 
     def handle_slash(self, command: str, args: str, context: ExtensionContext) -> bool:
@@ -1483,6 +1623,12 @@ class MemoryExtension(Extension):
             return True
         if command == "dream":
             self._trigger_dream(context)
+            return True
+        if command == "reindex":
+            self._trigger_reindex(context)
+            return True
+        if command == "stats":
+            self._show_codegraph_stats(context)
             return True
         return False
 
@@ -1808,6 +1954,418 @@ class MemoryExtension(Extension):
             "[dim]Paste the following as your next message to trigger consolidation:[/dim]\n\n"
             + prompt[:2000]
         )
+
+
+    # ------------------------------------------------------------------
+    # Codegraph query tool handlers
+    # ------------------------------------------------------------------
+
+    def _get_codegraph_db_path(self) -> str | None:
+        """Resolve the path to codegraph.db from the workspace root."""
+        workspace_root = None
+        if self._ext_context is not None:
+            if hasattr(self._ext_context, "_agent_config") and self._ext_context._agent_config:
+                workspace_root = getattr(self._ext_context._agent_config, "workspace_root", None)
+        if not workspace_root and self._store is not None:
+            workspace_root = str(self._store.root.parent.parent)
+        if not workspace_root:
+            workspace_root = "."
+        db_path = os.path.join(os.path.abspath(workspace_root), ".codegraph", "codegraph.db")
+        if os.path.isfile(db_path):
+            return db_path
+        return None
+
+    def _codegraph_connect(self, db_path: str):
+        """Open a read-only SQLite connection to codegraph.db."""
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _format_node_row(self, row, include_content: bool = False, max_content: int = 800) -> str:
+        """Format a node row into a readable string for the LLM."""
+        name = row["name"]
+        kind = row["kind"]
+        lang = row["lang"]
+        file_path = row["file_path"]
+        start_line = row["start_line"]
+        end_line = row["end_line"]
+        header = f"{name} ({kind}, {lang}) — {file_path}:{start_line}-{end_line}"
+        if include_content:
+            content = (row["content"] or "").strip()
+            if content:
+                if len(content) > max_content:
+                    content = content[:max_content].rstrip() + "\n...[truncated]"
+                header += f"\n```{lang}\n{content}\n```"
+        return header
+
+    def _handle_codegraph_search(
+        self,
+        query: str,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Search the codegraph index for symbols by name/keyword."""
+        db_path = self._get_codegraph_db_path()
+        if db_path is None:
+            return ("No codegraph index found. Run /reindex to create one, "
+                    "then retry this search.")
+        limit = min(max(1, limit or 20), 50)
+        try:
+            conn = self._codegraph_connect(db_path)
+            try:
+                # Try FTS5 first for fast matching
+                try:
+                    if kind:
+                        rows = conn.execute(
+                            "SELECT n.* FROM nodes n "
+                            "JOIN nodes_fts f ON f.rowid = n.rowid "
+                            "WHERE nodes_fts MATCH ? AND n.kind = ? "
+                            "ORDER BY rank LIMIT ?",
+                            (query, kind, limit),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT n.* FROM nodes n "
+                            "JOIN nodes_fts f ON f.rowid = n.rowid "
+                            "WHERE nodes_fts MATCH ? "
+                            "ORDER BY rank LIMIT ?",
+                            (query, limit),
+                        ).fetchall()
+                except Exception:
+                    # FTS5 match syntax error — fall back to LIKE
+                    rows = []
+
+                # Fall back to LIKE search if FTS returned nothing
+                if not rows:
+                    like_q = f"%{query}%"
+                    if kind:
+                        rows = conn.execute(
+                            "SELECT * FROM nodes WHERE (name LIKE ? OR content LIKE ?) "
+                            "AND kind = ? ORDER BY name LIMIT ?",
+                            (like_q, like_q, kind, limit),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT * FROM nodes WHERE name LIKE ? OR content LIKE ? "
+                            "ORDER BY name LIMIT ?",
+                            (like_q, like_q, limit),
+                        ).fetchall()
+            finally:
+                conn.close()
+
+            if not rows:
+                return f"No symbols found matching '{query}'" + (
+                    f" (kind={kind})" if kind else ""
+                ) + ". Try a different query or check /stats to verify the index exists."
+
+            results = []
+            for r in rows:
+                results.append(self._format_node_row(dict(r), include_content=True, max_content=600))
+            header = f"Found {len(rows)} symbol(s) matching '{query}'" + (
+                f" (kind={kind})" if kind else ""
+            ) + ":\n"
+            return header + "\n\n".join(results)
+        except Exception as exc:
+            logger.warning("codegraph_search failed: %s", exc)
+            return f"Codegraph search error: {exc}"
+
+    def _handle_codegraph_get_symbol(
+        self,
+        name: str,
+        file_path: str | None = None,
+    ) -> str:
+        """Get the full definition of a specific symbol."""
+        db_path = self._get_codegraph_db_path()
+        if db_path is None:
+            return ("No codegraph index found. Run /reindex to create one, "
+                    "then retry this lookup.")
+        try:
+            conn = self._codegraph_connect(db_path)
+            try:
+                if file_path:
+                    rows = conn.execute(
+                        "SELECT * FROM nodes WHERE name = ? AND file_path LIKE ? "
+                        "ORDER BY kind, file_path LIMIT 5",
+                        (name, f"%{file_path}%"),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM nodes WHERE name = ? "
+                        "ORDER BY kind, file_path LIMIT 10",
+                        (name,),
+                    ).fetchall()
+            finally:
+                conn.close()
+
+            if not rows:
+                return (f"Symbol '{name}' not found in the codegraph index."
+                        " Try codegraph_search to find similar names.")
+
+            results = []
+            for r in rows:
+                results.append(self._format_node_row(dict(r), include_content=True, max_content=2000))
+            return f"Symbol '{name}' ({len(rows)} definition(s)):\n\n" + "\n\n---\n\n".join(results)
+        except Exception as exc:
+            logger.warning("codegraph_get_symbol failed: %s", exc)
+            return f"Codegraph lookup error: {exc}"
+
+    def _handle_codegraph_get_callers(
+        self,
+        name: str,
+        file_path: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Find all symbols that call/reference a target symbol."""
+        db_path = self._get_codegraph_db_path()
+        if db_path is None:
+            return ("No codegraph index found. Run /reindex to create one.")
+        limit = min(max(1, limit or 20), 50)
+        try:
+            conn = self._codegraph_connect(db_path)
+            try:
+                # First find the target node(s)
+                if file_path:
+                    target_rows = conn.execute(
+                        "SELECT id, name, kind, file_path FROM nodes "
+                        "WHERE name = ? AND file_path LIKE ? LIMIT 5",
+                        (name, f"%{file_path}%"),
+                    ).fetchall()
+                else:
+                    target_rows = conn.execute(
+                        "SELECT id, name, kind, file_path FROM nodes "
+                        "WHERE name = ? LIMIT 5",
+                        (name,),
+                    ).fetchall()
+
+                if not target_rows:
+                    return (f"Symbol '{name}' not found in the codegraph index."
+                            " Try codegraph_search to find similar names.")
+
+                # Collect all target IDs
+                target_ids = [r["id"] for r in target_rows]
+                placeholders = ",".join("?" * len(target_ids))
+
+                # Find callers via edges where target_id matches
+                caller_rows = conn.execute(
+                    f"SELECT DISTINCT n.name, n.kind, n.lang, n.file_path, n.start_line, n.end_line, e.kind as edge_kind "
+                    f"FROM edges e JOIN nodes n ON n.id = e.source_id "
+                    f"WHERE e.target_id IN ({placeholders}) "
+                    f"ORDER BY n.file_path, n.start_line LIMIT ?",
+                    (*target_ids, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+
+            target_desc = ", ".join(f"{r['name']} ({r['kind']}) in {r['file_path']}" for r in target_rows)
+            if not caller_rows:
+                return f"No callers found for {target_desc}."
+
+            results = []
+            for r in caller_rows:
+                results.append(
+                    f"  • {r['name']} ({r['kind']}, {r['lang']}) — {r['file_path']}:{r['start_line']}-{r['end_line']}  [{r['edge_kind']}]"
+                )
+            return (f"Callers of {target_desc} ({len(caller_rows)} found):\n" +
+                    "\n".join(results))
+        except Exception as exc:
+            logger.warning("codegraph_get_callers failed: %s", exc)
+            return f"Codegraph callers error: {exc}"
+
+    def _handle_codegraph_get_callees(
+        self,
+        name: str,
+        file_path: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Find all symbols that a target symbol calls/depends on."""
+        db_path = self._get_codegraph_db_path()
+        if db_path is None:
+            return ("No codegraph index found. Run /reindex to create one.")
+        limit = min(max(1, limit or 20), 50)
+        try:
+            conn = self._codegraph_connect(db_path)
+            try:
+                # First find the target node(s)
+                if file_path:
+                    target_rows = conn.execute(
+                        "SELECT id, name, kind, file_path FROM nodes "
+                        "WHERE name = ? AND file_path LIKE ? LIMIT 5",
+                        (name, f"%{file_path}%"),
+                    ).fetchall()
+                else:
+                    target_rows = conn.execute(
+                        "SELECT id, name, kind, file_path FROM nodes "
+                        "WHERE name = ? LIMIT 5",
+                        (name,),
+                    ).fetchall()
+
+                if not target_rows:
+                    return (f"Symbol '{name}' not found in the codegraph index."
+                            " Try codegraph_search to find similar names.")
+
+                # Collect all source IDs
+                source_ids = [r["id"] for r in target_rows]
+                placeholders = ",".join("?" * len(source_ids))
+
+                # Find callees via edges where source_id matches
+                callee_rows = conn.execute(
+                    f"SELECT DISTINCT n.name, n.kind, n.lang, n.file_path, n.start_line, n.end_line, e.kind as edge_kind "
+                    f"FROM edges e JOIN nodes n ON n.id = e.target_id "
+                    f"WHERE e.source_id IN ({placeholders}) "
+                    f"ORDER BY n.file_path, n.start_line LIMIT ?",
+                    (*source_ids, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+
+            target_desc = ", ".join(f"{r['name']} ({r['kind']}) in {r['file_path']}" for r in target_rows)
+            if not callee_rows:
+                return f"No callees found for {target_desc}."
+
+            results = []
+            for r in callee_rows:
+                results.append(
+                    f"  • {r['name']} ({r['kind']}, {r['lang']}) — {r['file_path']}:{r['start_line']}-{r['end_line']}  [{r['edge_kind']}]"
+                )
+            return (f"Callees of {target_desc} ({len(callee_rows)} found):\n" +
+                    "\n".join(results))
+        except Exception as exc:
+            logger.warning("codegraph_get_callees failed: %s", exc)
+            return f"Codegraph callees error: {exc}"
+
+    def _show_codegraph_stats(self, context: ExtensionContext) -> None:
+        """Show codegraph index statistics."""
+        # Resolve workspace
+        workspace_root = None
+        if hasattr(context, "_agent_config") and context._agent_config:
+            workspace_root = getattr(context._agent_config, "workspace_root", None)
+        if not workspace_root and self._store is not None:
+            workspace_root = str(self._store.root.parent.parent)
+        if not workspace_root:
+            workspace_root = "."
+
+        workspace_path = os.path.abspath(workspace_root)
+        db_path = os.path.join(workspace_path, ".codegraph", "codegraph.db")
+
+        if not os.path.isfile(db_path):
+            context.print(f"[yellow]No codegraph index found at {db_path}[/yellow]\n"
+                          "[dim]Run /reindex to create one.[/dim]")
+            return
+
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path, timeout=5)
+            conn.row_factory = sqlite3.Row
+            try:
+                node_count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+                kinds = conn.execute("SELECT kind, COUNT(*) as cnt FROM nodes GROUP BY kind ORDER BY cnt DESC").fetchall()
+                langs = conn.execute("SELECT lang, COUNT(*) as cnt FROM nodes GROUP BY lang ORDER BY cnt DESC").fetchall()
+            finally:
+                conn.close()
+
+            lines = [
+                f"[bold cyan]Codegraph Statistics[/bold cyan]  [dim]({workspace_path})[/dim]",
+                f"  [bold]Nodes:[/bold] {node_count:,}",
+                f"  [bold]Edges:[/bold] {edge_count:,}",
+            ]
+            if kinds:
+                lines.append("  [bold]Kinds:[/bold]")
+                for row in kinds:
+                    lines.append(f"    {row[0]:>12}: {row[1]:,}")
+            if langs:
+                lines.append("  [bold]Languages:[/bold]")
+                for row in langs:
+                    lines.append(f"    {row[0]:>12}: {row[1]:,}")
+
+            context.print("\n".join(lines))
+        except Exception as e:
+            context.print(f"[red]Failed to read codegraph stats:[/red] {e}")
+
+    def _trigger_reindex(self, context: ExtensionContext) -> None:
+        # Resolve workspace root from agent_config, or fall back to memory store root
+        workspace_root = None
+        if hasattr(context, "_agent_config") and context._agent_config:
+            workspace_root = getattr(context._agent_config, "workspace_root", None)
+        if not workspace_root and self._store is not None:
+            # Memory store root is <workspace>/.tau/memory — go up 2 levels
+            workspace_root = str(self._store.root.parent.parent)
+        if not workspace_root:
+            workspace_root = "."
+
+        workspace_path = os.path.abspath(workspace_root)
+        logger.info("Reindex: resolved workspace_path=%s", workspace_path)
+
+        def _safe_print(msg: str) -> None:
+            """Print to context, swallowing errors to avoid crashing the thread."""
+            try:
+                context.print(msg)
+            except Exception:
+                logger.warning("context.print failed: %s", msg)
+
+        _safe_print(f"[cyan]Reindexing codebase started in background...[/cyan] [dim]({workspace_path})[/dim]")
+
+        def _run_reindex():
+            try:
+                import subprocess
+
+                # Build environment with PYTHONPATH to the directory containing codegraph package
+                pkg_dir = str(Path(__file__).resolve().parent.parent.parent.parent)
+                env = os.environ.copy()
+                env_paths = [pkg_dir, workspace_path]
+                if "PYTHONPATH" in env:
+                    env_paths.append(env["PYTHONPATH"])
+                env["PYTHONPATH"] = os.pathsep.join(env_paths)
+
+                logger.info("Reindex: pkg_dir=%s, workspace=%s, python=%s", pkg_dir, workspace_path, sys.executable)
+
+                # Check if we should initialize codegraph if .codegraph/ does not exist
+                codegraph_dir = os.path.join(workspace_path, ".codegraph")
+                if not os.path.exists(codegraph_dir):
+                    _safe_print("[dim]Initializing codegraph database...[/dim]")
+                    init_cmd = [sys.executable, "-m", "codegraph.cli", "init", workspace_path]
+                    logger.info("Reindex init cmd: %s", init_cmd)
+                    init_res = subprocess.run(
+                        init_cmd, capture_output=True, text=True, env=env, timeout=60,
+                    )
+                    if init_res.returncode != 0:
+                        err_msg = (init_res.stderr or init_res.stdout or "unknown error").strip()
+                        logger.error("Codegraph init failed (rc=%d): %s", init_res.returncode, err_msg)
+                        _safe_print(f"\n[red]Codegraph initialization failed:[/red]\n{err_msg}")
+                        return
+
+                # Run codegraph index
+                index_cmd = [sys.executable, "-m", "codegraph.cli", "index", workspace_path]
+                logger.info("Reindex index cmd: %s", index_cmd)
+                index_res = subprocess.run(
+                    index_cmd, capture_output=True, text=True, env=env, timeout=300,
+                )
+
+                logger.info("Reindex result: rc=%d, stdout=%d bytes, stderr=%d bytes",
+                            index_res.returncode, len(index_res.stdout), len(index_res.stderr))
+
+                if index_res.returncode == 0:
+                    # Clean up output lines to show summary
+                    out_lines = [line.strip() for line in index_res.stdout.splitlines() if line.strip()]
+                    summary = " ".join(out_lines[-3:]) if out_lines else "Index complete."
+                    _safe_print(f"\n[green]Codebase reindexing complete.[/green] {summary}")
+                else:
+                    err_msg = (index_res.stderr or index_res.stdout or "unknown error").strip()
+                    logger.error("Codegraph index failed (rc=%d): %s", index_res.returncode, err_msg)
+                    _safe_print(f"\n[red]Codebase reindexing failed:[/red]\n{err_msg}")
+
+            except subprocess.TimeoutExpired:
+                logger.error("Reindexing timed out after 300s")
+                _safe_print("\n[red]Codebase reindexing timed out after 5 minutes.[/red]")
+            except Exception as e:
+                logger.warning("Reindexing background thread failed: %s", e, exc_info=True)
+                _safe_print(f"\n[red]Codebase reindexing failed:[/red] {e}")
+
+        import threading
+        t = threading.Thread(target=_run_reindex, name="ReindexAgentThread")
+        t.daemon = True
+        t.start()
 
     # ------------------------------------------------------------------
     # Auto memory (phase 1)
