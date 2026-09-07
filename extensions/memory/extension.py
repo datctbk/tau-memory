@@ -1489,103 +1489,39 @@ class MemoryExtension(Extension):
                 handler=self._handle_memory_search,
             ),
             # ----------------------------------------------------------
+            # ----------------------------------------------------------
             # Codegraph query tools — let the LLM query the code index
             # ----------------------------------------------------------
             ToolDefinition(
-                name="codegraph_search",
+                name="codegraph_explore",
                 description=(
-                    "Search the codebase index for symbols (functions, classes, variables, imports) "
-                    "by name or keyword. Returns matching symbol definitions with file paths and code snippets. "
-                    "Use this FIRST when the user asks about a symbol, class, function, or code concept. "
-                    "This searches the pre-built code graph index (much faster and more accurate than grep)."
+                    "Universal CodeGraph exploration tool. MANDATORY TOOL to search, read, analyze, "
+                    "or explore any code symbol, class, function, flow concept, or refactoring impact in one call. "
+                    "Returns verbatim line-numbered source code, callers/callees maps, and blast-radius summaries. "
+                    "ALWAYS call this tool for any code search or code analysis question."
                 ),
                 parameters={
                     "query": ToolParameter(
                         type="string",
-                        description="Search query — a symbol name, keyword, or partial name (e.g. 'KnowledgeGraphMCP', 'parse', 'auth').",
+                        description="Search query, symbol name, method, class, or architectural flow concept (e.g. 'submitV5', 'ACBSContractController').",
                     ),
-                    "kind": ToolParameter(
+                    "project_path": ToolParameter(
                         type="string",
-                        description="Optional filter by symbol kind: function, class, variable, import, module, method, decorator.",
+                        description="Optional project path to query (for monorepos or multi-project setups). Defaults to active workspace.",
+                        required=False,
+                    ),
+                    "target_symbol": ToolParameter(
+                        type="string",
+                        description="Optional target symbol name to trace flow towards.",
                         required=False,
                     ),
                     "limit": ToolParameter(
                         type="integer",
-                        description="Maximum results to return (default 20, max 50).",
+                        description="Maximum symbols to return in detail (default 10, max 30).",
                         required=False,
                     ),
                 },
-                handler=self._handle_codegraph_search,
-            ),
-            ToolDefinition(
-                name="codegraph_get_symbol",
-                description=(
-                    "Get the full source code definition of a specific symbol (class, function, variable). "
-                    "Returns the complete code content, file path, line range, and metadata. "
-                    "Use this when you need to read the actual implementation of a known symbol."
-                ),
-                parameters={
-                    "name": ToolParameter(
-                        type="string",
-                        description="Exact symbol name to look up (e.g. 'KnowledgeGraphMCP', 'build_rehydrate_block').",
-                    ),
-                    "file_path": ToolParameter(
-                        type="string",
-                        description="Optional file path filter to disambiguate symbols with the same name.",
-                        required=False,
-                    ),
-                },
-                handler=self._handle_codegraph_get_symbol,
-            ),
-            ToolDefinition(
-                name="codegraph_get_callers",
-                description=(
-                    "Find all symbols that CALL or REFERENCE a target symbol. "
-                    "Use this for impact analysis — to see what depends on a function/class before refactoring. "
-                    "Returns caller names, file paths, and relationship types."
-                ),
-                parameters={
-                    "name": ToolParameter(
-                        type="string",
-                        description="Target symbol name to find callers of.",
-                    ),
-                    "file_path": ToolParameter(
-                        type="string",
-                        description="Optional file path filter to disambiguate.",
-                        required=False,
-                    ),
-                    "limit": ToolParameter(
-                        type="integer",
-                        description="Maximum results (default 20, max 50).",
-                        required=False,
-                    ),
-                },
-                handler=self._handle_codegraph_get_callers,
-            ),
-            ToolDefinition(
-                name="codegraph_get_callees",
-                description=(
-                    "Find all symbols that a target symbol CALLS or DEPENDS ON. "
-                    "Use this to understand what a function relies on — trace its dependencies. "
-                    "Returns callee names, file paths, and relationship types."
-                ),
-                parameters={
-                    "name": ToolParameter(
-                        type="string",
-                        description="Target symbol name to find callees of.",
-                    ),
-                    "file_path": ToolParameter(
-                        type="string",
-                        description="Optional file path filter to disambiguate.",
-                        required=False,
-                    ),
-                    "limit": ToolParameter(
-                        type="integer",
-                        description="Maximum results (default 20, max 50).",
-                        required=False,
-                    ),
-                },
-                handler=self._handle_codegraph_get_callees,
+                handler=self._handle_codegraph_explore,
             ),
         ]
 
@@ -1960,19 +1896,34 @@ class MemoryExtension(Extension):
     # Codegraph query tool handlers
     # ------------------------------------------------------------------
 
-    def _get_codegraph_db_path(self) -> str | None:
-        """Resolve the path to codegraph.db from the workspace root."""
+    def _get_codegraph_db_path(self, project_path: str | None = None) -> str | None:
+        """Resolve the path to codegraph.db from project_path or workspace root."""
+        if project_path:
+            abs_p = os.path.abspath(project_path)
+            db_path = os.path.join(abs_p, ".codegraph", "codegraph.db")
+            if os.path.isfile(db_path):
+                return db_path
+            if os.path.basename(abs_p) == "codegraph.db" and os.path.isfile(abs_p):
+                return abs_p
+            return None
+
         workspace_root = None
         if self._ext_context is not None:
             if hasattr(self._ext_context, "_agent_config") and self._ext_context._agent_config:
                 workspace_root = getattr(self._ext_context._agent_config, "workspace_root", None)
         if not workspace_root and self._store is not None:
             workspace_root = str(self._store.root.parent.parent)
-        if not workspace_root:
-            workspace_root = "."
-        db_path = os.path.join(os.path.abspath(workspace_root), ".codegraph", "codegraph.db")
-        if os.path.isfile(db_path):
-            return db_path
+
+        if workspace_root:
+            db_path = os.path.join(os.path.abspath(workspace_root), ".codegraph", "codegraph.db")
+            if os.path.isfile(db_path):
+                return db_path
+
+        # Fallback to current working directory
+        cwd_db = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
+        if os.path.isfile(cwd_db):
+            return cwd_db
+
         return None
 
     def _codegraph_connect(self, db_path: str):
@@ -1981,6 +1932,172 @@ class MemoryExtension(Extension):
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _handle_codegraph_explore(
+        self,
+        query: str,
+        project_path: str | None = None,
+        target_symbol: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Answer code exploration questions in one unified call."""
+        db_path = self._get_codegraph_db_path(project_path=project_path)
+        if db_path is None:
+            target_desc = f"at '{project_path}'" if project_path else "in active workspace"
+            return (
+                f"No codegraph index found {target_desc}. "
+                "You can use built-in tools (read_file, grep, search_files) instead, "
+                "or run 'codegraph index' to create a code graph database."
+            )
+
+        limit = min(max(1, limit or 10), 30)
+        try:
+            conn = self._codegraph_connect(db_path)
+            try:
+                # 1. Fetch exact matches first
+                like_exact = query.lower()
+                exact_rows = conn.execute(
+                    "SELECT * FROM nodes WHERE LOWER(name) = ? ORDER BY file_path LIMIT 20",
+                    (like_exact,),
+                ).fetchall()
+
+                # 2. Fetch FTS or LIKE matches for broader candidate pool
+                try:
+                    fts_query = f"{query}*" if not query.endswith("*") else query
+                    fts_rows = conn.execute(
+                        "SELECT n.* FROM nodes n "
+                        "JOIN nodes_fts f ON f.rowid = n.rowid "
+                        "WHERE nodes_fts MATCH ? "
+                        "ORDER BY rank LIMIT 100",
+                        (fts_query,),
+                    ).fetchall()
+                except Exception:
+                    fts_rows = []
+
+                if not fts_rows:
+                    like_q = f"%{query}%"
+                    fts_rows = conn.execute(
+                        "SELECT * FROM nodes WHERE name LIKE ? OR content LIKE ? "
+                        "ORDER BY name LIMIT 100",
+                        (like_q, like_q),
+                    ).fetchall()
+
+                # Combine exact_rows and fts_rows (deduplicating by node id)
+                seen_ids = set()
+                candidate_nodes = []
+                for r in list(exact_rows) + list(fts_rows):
+                    d = dict(r)
+                    if d["id"] not in seen_ids:
+                        seen_ids.add(d["id"])
+                        candidate_nodes.append(d)
+
+                if not candidate_nodes:
+                    return f"No symbols found matching '{query}'. Try a different search query or check /stats."
+
+                # Prioritize exact symbol matches and production code over test files
+                def _rank_node(n):
+                    n_name = (n.get("name") or "").lower()
+                    q = query.lower()
+                    exact_match = 0 if n_name == q else (1 if n_name.startswith(q) else 2)
+                    is_test = 1 if ("/test/" in n.get("file_path", "").lower() or "/tests/" in n.get("file_path", "").lower()) else 0
+                    return (exact_match, is_test, len(n_name))
+
+                candidate_nodes.sort(key=_rank_node)
+                nodes = candidate_nodes[:limit]
+                output_sections = []
+
+                # Section A: Verbatim Source Code with Line Numbers
+                src_lines = ["### 📄 Verbatim Source Code\n"]
+                for n in nodes[:5]:
+                    name = n.get("name", "unknown")
+                    kind = n.get("kind", "symbol")
+                    lang = n.get("lang", "text")
+                    fpath = n.get("file_path", "")
+                    sline = n.get("start_line", 1)
+                    eline = n.get("end_line", sline)
+                    raw_content = n.get("content") or ""
+
+                    content_lines = raw_content.splitlines()
+                    numbered_lines = [f"{sline + idx:4d} | {line}" for idx, line in enumerate(content_lines[:50])]
+                    formatted_src = "\n".join(numbered_lines)
+                    if len(content_lines) > 50:
+                        formatted_src += f"\n     | ... [{len(content_lines) - 50} more lines]"
+
+                    src_lines.append(f"**`{name}`** ({kind}, `{lang}`) — [`{fpath}:{sline}-{eline}`]({fpath})\n```\n{formatted_src}\n```")
+
+                output_sections.append("\n".join(src_lines))
+
+                # Section B: Call Flows & Relationship Maps (Callers & Callees)
+                rel_lines = ["### 🔄 Relationship Map & Call Flows\n"]
+                impacted_files = set()
+
+                for n in nodes[:5]:
+                    nid = n["id"]
+                    mname = n["name"]
+
+                    callers = conn.execute(
+                        "SELECT n.name, n.kind, n.file_path, n.start_line "
+                        "FROM edges e JOIN nodes n ON e.source_id = n.id "
+                        "WHERE e.target_id = ?",
+                        (nid,),
+                    ).fetchall()
+
+                    callees = conn.execute(
+                        "SELECT n.name, n.kind, n.file_path, n.start_line "
+                        "FROM edges e JOIN nodes n ON e.target_id = n.id "
+                        "WHERE e.source_id = ?",
+                        (nid,),
+                    ).fetchall()
+
+                    if callers:
+                        rel_lines.append(f"**Callers of `{mname}`** ({len(callers)}):")
+                        for c in callers[:10]:
+                            impacted_files.add(c["file_path"])
+                            rel_lines.append(f"- `{c['name']}` ({c['kind']}) in `{c['file_path']}:{c['start_line']}`")
+
+                    if callees:
+                        rel_lines.append(f"**Callees of `{mname}`** ({len(callees)}):")
+                        for c in callees[:10]:
+                            rel_lines.append(f"- `{c['name']}` ({c['kind']}) in `{c['file_path']}:{c['start_line']}`")
+
+                    if not callers and not callees:
+                        rel_lines.append(f"- `{mname}`: No direct graph edges recorded.")
+
+                output_sections.append("\n".join(rel_lines))
+
+                # Section C: Optional Trace Path if target_symbol provided
+                if target_symbol:
+                    target_rows = conn.execute(
+                        "SELECT * FROM nodes WHERE name LIKE ? LIMIT 1", (f"%{target_symbol}%",)
+                    ).fetchall()
+                    if target_rows:
+                        tnode = dict(target_rows[0])
+                        output_sections.append(
+                            f"### 🎯 Trace Path: `{query}` → `{tnode['name']}`\n"
+                            f"- Start: `{nodes[0]['name']}` (`{nodes[0]['file_path']}:{nodes[0]['start_line']}`)\n"
+                            f"- Target: `{tnode['name']}` (`{tnode['file_path']}:{tnode['start_line']}`)"
+                        )
+
+                # Section D: Blast-Radius & Impact Analysis
+                impact_lines = ["### ⚡ Blast-Radius Summary\n"]
+                total_impacted_files = len(impacted_files)
+                impact_lines.append(f"- **Primary Matched Symbols**: {len(nodes)}")
+                impact_lines.append(f"- **Direct Dependent Files**: {total_impacted_files}")
+                if impacted_files:
+                    impact_lines.append("- **Files potentially affected by changes**:")
+                    for f in list(impacted_files)[:10]:
+                        impact_lines.append(f"  • `{f}`")
+
+                output_sections.append("\n".join(impact_lines))
+
+                header = f"## 🔍 CodeGraph Exploration Results for '{query}'\n\n"
+                return header + "\n\n---\n\n".join(output_sections)
+
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("codegraph_explore failed: %s", exc)
+            return f"Codegraph explore error: {exc}"
 
     def _format_node_row(self, row, include_content: bool = False, max_content: int = 800) -> str:
         """Format a node row into a readable string for the LLM."""
@@ -2016,13 +2133,14 @@ class MemoryExtension(Extension):
             try:
                 # Try FTS5 first for fast matching
                 try:
+                    fts_query = f"{query}*" if not query.endswith("*") else query
                     if kind:
                         rows = conn.execute(
                             "SELECT n.* FROM nodes n "
                             "JOIN nodes_fts f ON f.rowid = n.rowid "
                             "WHERE nodes_fts MATCH ? AND n.kind = ? "
                             "ORDER BY rank LIMIT ?",
-                            (query, kind, limit),
+                            (fts_query, kind, limit),
                         ).fetchall()
                     else:
                         rows = conn.execute(
@@ -2030,7 +2148,7 @@ class MemoryExtension(Extension):
                             "JOIN nodes_fts f ON f.rowid = n.rowid "
                             "WHERE nodes_fts MATCH ? "
                             "ORDER BY rank LIMIT ?",
-                            (query, limit),
+                            (fts_query, limit),
                         ).fetchall()
                 except Exception:
                     # FTS5 match syntax error — fall back to LIKE

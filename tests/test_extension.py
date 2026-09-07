@@ -106,12 +106,12 @@ class TestSlashCommands:
     def test_registers_three_commands(self, ext_with_store):
         ext, _, _ = ext_with_store
         cmds = ext.slash_commands()
-        assert len(cmds) == 3
+        assert len(cmds) == 4
 
     def test_command_names(self, ext_with_store):
         ext, _, _ = ext_with_store
         names = {c.name for c in ext.slash_commands()}
-        assert names == {"memory", "dream", "reindex"}
+        assert names == {"memory", "dream", "reindex", "stats"}
 
     def test_handle_memory(self, ext_with_store, ctx_mock):
         ext, _, _ = ext_with_store
@@ -736,3 +736,38 @@ class TestTopKRetrieval:
         assert "[memory:" in block
         assert "[session:" in block
         assert "sess_abc" in block
+
+    def test_codegraph_explore_handler(self, tmp_path):
+        import sqlite3
+        ext = MemoryExtension()
+
+        # Create mock .codegraph/codegraph.db inside tmp_path
+        cg_dir = tmp_path / ".codegraph"
+        cg_dir.mkdir(parents=True, exist_ok=True)
+        db_path = cg_dir / "codegraph.db"
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, kind TEXT, lang TEXT, file_path TEXT, start_line INT, end_line INT, content TEXT)")
+        conn.execute("CREATE TABLE edges (id TEXT PRIMARY KEY, source_id TEXT, target_id TEXT, kind TEXT, weight REAL)")
+        conn.execute("CREATE VIRTUAL TABLE nodes_fts USING fts5(name, kind, lang, file_path)")
+        conn.execute("INSERT INTO nodes VALUES ('n1', 'submitV4', 'function', 'java', 'src/Main.java', 10, 20, 'public void submitV4() {}')")
+        conn.execute("INSERT INTO nodes_fts (rowid, name, kind, lang, file_path) VALUES (1, 'submitV4', 'function', 'java', 'src/Main.java')")
+        conn.commit()
+        conn.close()
+
+        ctx = MagicMock()
+        ctx._agent_config = MagicMock()
+        ctx._agent_config.workspace_root = str(tmp_path)
+        ext.on_load(ctx)
+
+        # Test exploration call
+        res = ext._handle_codegraph_explore("submitV4", project_path=str(tmp_path))
+        assert "CodeGraph Exploration Results for 'submitV4'" in res
+        assert "submitV4" in res
+        assert "Verbatim Source Code" in res
+        assert "Blast-Radius Summary" in res
+
+        # Test non-existent index fallback
+        missing_res = ext._handle_codegraph_explore("submitV4", project_path=str(tmp_path / "non_existent"))
+        assert "No codegraph index found" in missing_res
+
