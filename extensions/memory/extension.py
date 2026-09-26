@@ -1522,6 +1522,75 @@ class MemoryExtension(Extension):
                     ),
                 },
                 handler=self._handle_codegraph_explore,
+                risk="low",
+            ),
+            ToolDefinition(
+                name="codegraph_find_entry_points",
+                description=(
+                    "Find existing API entry points (REST Controllers, Endpoints, Routes). "
+                    "Use this tool when working on a feature or change request to locate existing entry points "
+                    "handling the business flow, their Request/Response DTOs, and injected Services."
+                ),
+                parameters={
+                    "query": ToolParameter(
+                        type="string",
+                        description="Business domain keyword (e.g. 'account', 'customer', 'order', 'register').",
+                    ),
+                    "project_id": ToolParameter(
+                        type="string",
+                        description="Optional project identifier filter.",
+                        required=False,
+                    ),
+                    "http_method": ToolParameter(
+                        type="string",
+                        description="Optional HTTP method (GET, POST, PUT, DELETE).",
+                        required=False,
+                    ),
+                    "project_path": ToolParameter(
+                        type="string",
+                        description="Optional path to project or .codegraph database.",
+                        required=False,
+                    ),
+                    "limit": ToolParameter(
+                        type="integer",
+                        description="Maximum entry points to return (default 5).",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_find_entry_points,
+                risk="low",
+            ),
+            ToolDefinition(
+                name="codegraph_impact_analysis",
+                description=(
+                    "CRITICAL MANDATORY TOOL FOR NEW FEATURES & CHANGE REQUESTS (CR): "
+                    "Analyze a new feature request or field addition by locating existing anchor points in the codebase. "
+                    "DO NOT grep/search for new symbols that do not exist yet; call this tool instead to identify "
+                    "the Request DTO to extend and the Service Implementation to update."
+                ),
+                parameters={
+                    "feature_description": ToolParameter(
+                        type="string",
+                        description="Full description of what needs to be added (e.g. 'Thêm người thụ hưởng beneficiaryOwner vào luồng đăng ký tài khoản').",
+                    ),
+                    "project_id": ToolParameter(
+                        type="string",
+                        description="Optional project identifier filter.",
+                        required=False,
+                    ),
+                    "domain_hint": ToolParameter(
+                        type="string",
+                        description="Optional domain keyword (e.g. 'account', 'customer', 'order').",
+                        required=False,
+                    ),
+                    "project_path": ToolParameter(
+                        type="string",
+                        description="Optional path to project or .codegraph database.",
+                        required=False,
+                    ),
+                },
+                handler=self._handle_codegraph_impact_analysis,
+                risk="low",
             ),
         ]
 
@@ -1897,14 +1966,18 @@ class MemoryExtension(Extension):
     # ------------------------------------------------------------------
 
     def _get_codegraph_db_path(self, project_path: str | None = None) -> str | None:
-        """Resolve the path to codegraph.db from project_path or workspace root."""
+        """Resolve the path to codegraph.db, system.db, or graph.db from project_path or workspace root."""
+        candidates = ("system.db", "codegraph.db", "graph.db")
         if project_path:
             abs_p = os.path.abspath(project_path)
-            db_path = os.path.join(abs_p, ".codegraph", "codegraph.db")
-            if os.path.isfile(db_path):
-                return db_path
-            if os.path.basename(abs_p) == "codegraph.db" and os.path.isfile(abs_p):
+            if not os.path.exists(abs_p):
+                return None
+            if os.path.isfile(abs_p) and abs_p.endswith(".db"):
                 return abs_p
+            start = abs_p if os.path.isdir(abs_p) else os.path.dirname(abs_p)
+            found = self._find_codegraph_db_upward(start, candidates)
+            if found:
+                return found
             return None
 
         workspace_root = None
@@ -1915,16 +1988,30 @@ class MemoryExtension(Extension):
             workspace_root = str(self._store.root.parent.parent)
 
         if workspace_root:
-            db_path = os.path.join(os.path.abspath(workspace_root), ".codegraph", "codegraph.db")
-            if os.path.isfile(db_path):
-                return db_path
+            found = self._find_codegraph_db_upward(os.path.abspath(workspace_root), candidates)
+            if found:
+                return found
 
-        # Fallback to current working directory
-        cwd_db = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
-        if os.path.isfile(cwd_db):
-            return cwd_db
+        # Fallback to current working directory upward
+        return self._find_codegraph_db_upward(os.getcwd(), candidates)
 
+    def _find_codegraph_db_upward(self, start_dir: str, candidates: tuple[str, ...]) -> str | None:
+        """Search upward from start_dir towards filesystem root for .codegraph/<candidate> or direct candidate."""
+        current = os.path.abspath(start_dir)
+        while True:
+            for c in candidates:
+                db_path = os.path.join(current, ".codegraph", c)
+                if os.path.isfile(db_path):
+                    return db_path
+                direct = os.path.join(current, c)
+                if os.path.isfile(direct):
+                    return direct
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
         return None
+
 
     def _codegraph_connect(self, db_path: str):
         """Open a read-only SQLite connection to codegraph.db."""
@@ -2098,6 +2185,135 @@ class MemoryExtension(Extension):
         except Exception as exc:
             logger.warning("codegraph_explore failed: %s", exc)
             return f"Codegraph explore error: {exc}"
+
+    def _handle_codegraph_find_entry_points(
+        self,
+        query: str = "",
+        project_id: str | None = None,
+        http_method: str | None = None,
+        project_path: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Find existing API entry points (REST Controllers, Endpoints, Routes)."""
+        db_path = self._get_codegraph_db_path(project_path=project_path)
+        if db_path is None:
+            return "No codegraph database found. Run 'codegraph index' first."
+
+        try:
+            from codegraph.db.sqlite_adapter import SQLiteAdapter
+            from codegraph.graph.graph_service import GraphService
+            from codegraph.graph.search_engine import SearchEngine
+            from codegraph.mcp_server.tools import KnowledgeGraphTools
+
+            adapter = SQLiteAdapter(db_path)
+            adapter.connect()
+            try:
+                tools = KnowledgeGraphTools(GraphService(adapter), SearchEngine(adapter), adapter)
+                results = tools.find_entry_points(
+                    query=query,
+                    project_id=project_id,
+                    http_method=http_method,
+                    limit=min(limit or 5, 20),
+                )
+                if not results:
+                    return f"No entry points found matching '{query}'."
+
+                output = [f"## Found {len(results)} Existing Entry Point(s) for '{query}'\n"]
+                for r in results:
+                    method = r["http_method"] or "ENDPOINT"
+                    route = r["route"] or r["name"]
+                    output.append(f"### 🚪 `{method} {route}` ({r['name']})")
+                    output.append(f"- **Location**: `{r['file_path']}:{r['start_line']}` (Project: `{r['project_id']}`)")
+                    if r.get("request_dto"):
+                        rd = r["request_dto"]
+                        output.append(f"- **Request DTO (CONSUMES_DTO)**: `{rd['name']}` at `{rd['file_path']}:{rd['start_line']}`")
+                    if r.get("response_dto"):
+                        rd = r["response_dto"]
+                        output.append(f"- **Response DTO (PRODUCES_DTO)**: `{rd['name']}` at `{rd['file_path']}:{rd['start_line']}`")
+                    if r.get("services"):
+                        output.append("- **Injected Services & Implementations**:")
+                        for s in r["services"]:
+                            impl_str = ""
+                            if s.get("implementations"):
+                                impl_names = [f"`{i['name']}` (`{i['file_path']}:{i['start_line']}`)" for i in s["implementations"]]
+                                impl_str = f" ➔ Implemented by: {', '.join(impl_names)}"
+                            output.append(f"  - `{s['name']}` at `{s['file_path']}:{s['start_line']}{impl_str}")
+                    output.append("")
+                return "\n".join(output)
+            finally:
+                adapter.close()
+        except Exception as exc:
+            logger.warning("codegraph_find_entry_points failed: %s", exc)
+            return f"Error executing codegraph_find_entry_points: {exc}"
+
+    def _handle_codegraph_impact_analysis(
+        self,
+        feature_description: str,
+        project_id: str | None = None,
+        domain_hint: str | None = None,
+        project_path: str | None = None,
+    ) -> str:
+        """Analyze a Change Request or new feature description to locate existing anchor points."""
+        db_path = self._get_codegraph_db_path(project_path=project_path)
+        if db_path is None:
+            return "No codegraph database found. Run 'codegraph index' first."
+
+        try:
+            from codegraph.db.sqlite_adapter import SQLiteAdapter
+            from codegraph.graph.graph_service import GraphService
+            from codegraph.graph.search_engine import SearchEngine
+            from codegraph.mcp_server.tools import KnowledgeGraphTools
+
+            adapter = SQLiteAdapter(db_path)
+            adapter.connect()
+            try:
+                tools = KnowledgeGraphTools(GraphService(adapter), SearchEngine(adapter), adapter)
+                report = tools.impact_analysis(
+                    feature_description=feature_description,
+                    project_id=project_id,
+                    domain_hint=domain_hint,
+                )
+
+                output = [
+                    f"# 🎯 Change Request Impact Analysis",
+                    f"**Request**: {feature_description}",
+                    f"**Identified Domain Keywords**: `{', '.join(report['extracted_keywords'])}`\n",
+                ]
+
+                if report.get("entry_points"):
+                    output.append("## 1. Existing Entry Points Handling This Flow:")
+                    for ep in report["entry_points"]:
+                        m = ep["http_method"] or "ENDPOINT"
+                        r = ep["route"] or ep["name"]
+                        output.append(f"- **`{m} {r}`** at `{ep['file_path']}:{ep['start_line']}`")
+                    output.append("")
+
+                if report.get("dtos_to_extend"):
+                    output.append("## 2. 📝 Request DTOs to Extend (Add New Fields Here):")
+                    for dto in report["dtos_to_extend"]:
+                        output.append(f"- **`{dto['name']}`** in `{dto['file_path']}:{dto['start_line']}`")
+                    output.append("")
+                else:
+                    output.append("## 2. 📝 Request DTO: No explicit DTO bound to endpoint, check Controller parameters directly.\n")
+
+                if report.get("services_to_modify"):
+                    output.append("## 3. ⚙️ Service Implementations to Update (Add Business Logic Here):")
+                    for svc in report["services_to_modify"]:
+                        output.append(f"- **`{svc['name']}`** in `{svc['file_path']}:{svc['start_line']}`")
+                    output.append("")
+
+                output.append("## 4. 🧭 Action Checklist for Agent:")
+                output.append("1. **Do NOT search for non-existent keywords across the repository.**")
+                output.append("2. **Open the Request DTO file(s) listed above and add the requested field(s).**")
+                output.append("3. **Open the Service Implementation file(s) listed above and update the method logic to persist or propagate the new field(s).**")
+                output.append("4. **Verify changes by running existing tests or building the project.**")
+
+                return "\n".join(output)
+            finally:
+                adapter.close()
+        except Exception as exc:
+            logger.warning("codegraph_impact_analysis failed: %s", exc)
+            return f"Error executing codegraph_impact_analysis: {exc}"
 
     def _format_node_row(self, row, include_content: bool = False, max_content: int = 800) -> str:
         """Format a node row into a readable string for the LLM."""

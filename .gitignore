@@ -1,42 +1,41 @@
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-tests/__pycache__/test_extension.cpython-312-pytest-7.4.3.pyc
-extensions/memory/__pycache__/extension.cpython-310.pyc
-tests/__pycache__/test_extension.cpython-39-pytest-8.4.2.pyc
-extensions/memory/__pycache__/extension.cpython-39.pyc
-tests/__pycache__/__init__.cpython-39.pyc
-extensions/memory/__pycache__/extension.cpython-311.pyc
-tests/__pycache__/test_extension.cpython-311-pytest-7.4.4.pyc
-tests/__pycache__/__init__.cpython-311.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/vector_index.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/embedding_cache.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-tests/__pycache__/test_embedding_cache.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_extension.cpython-312-pytest-7.4.3.pyc
-extensions/memory/__pycache__/embedder.cpython-312.pyc
-tests/__pycache__/test_embedding_cache.cpython-312-pytest-7.4.3.pyc
-extensions/memory/__pycache__/embedder.cpython-312.pyc
-tests/__pycache__/test_embedding_cache.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_extension.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_phase4_feature_flags.cpython-312-pytest-7.4.3.pyc
-extensions/memory/__pycache__/embedder.cpython-312.pyc
-extensions/memory/__pycache__/embedding_cache.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/vector_index.cpython-312.pyc
-tests/__pycache__/test_embedding_cache.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_extension.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_phase4_feature_flags.cpython-312-pytest-7.4.3.pyc
-extensions/memory/__pycache__/vector_index.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/embedding_cache.cpython-312.pyc
-extensions/memory/__pycache__/embedder.cpython-312.pyc
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
 
-extensions/memory/__pycache__/embedder.cpython-312.pyc
-extensions/memory/__pycache__/embedding_cache.cpython-312.pyc
-extensions/memory/__pycache__/extension.cpython-312.pyc
-extensions/memory/__pycache__/vector_index.cpython-312.pyc
-tests/__pycache__/test_embedding_cache.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_extension.cpython-312-pytest-7.4.3.pyc
-tests/__pycache__/test_phase4_feature_flags.cpython-312-pytest-7.4.3.pyc
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Memory persistence & runtime artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.tau/
+*.log
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
