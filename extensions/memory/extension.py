@@ -2302,11 +2302,28 @@ class MemoryExtension(Extension):
                         output.append(f"- **`{svc['name']}`** in `{svc['file_path']}:{svc['start_line']}`")
                     output.append("")
 
-                output.append("## 4. 🧭 Action Checklist for Agent:")
+                if report.get("documents_to_update"):
+                    output.append("## 4. 📄 Document Specifications to Update (aidlc-docs):")
+                    for doc in report["documents_to_update"]:
+                        action = doc.get("action_required", "")
+                        action_str = f" — {action}" if action else ""
+                        output.append(f"- **`{doc['artifact_id']}`** in `{doc['artifact_uri']}`{action_str}")
+                    output.append("")
+
+                output.append(f"## {5 if report.get('documents_to_update') else 4}. 🧭 Action Checklist for Agent:")
                 output.append("1. **Do NOT search for non-existent keywords across the repository.**")
                 output.append("2. **Open the Request DTO file(s) listed above and add the requested field(s).**")
                 output.append("3. **Open the Service Implementation file(s) listed above and update the method logic to persist or propagate the new field(s).**")
-                output.append("4. **Verify changes by running existing tests or building the project.**")
+                if report.get("documents_to_update"):
+                    output.append("4. **Update the Document Specification(s) listed in Section 4 to keep documentation synchronized with code.**")
+                    output.append("5. **Verify changes by running existing tests or building the project.**")
+                else:
+                    output.append("4. **Verify changes by running existing tests or building the project.**")
+
+                if report.get("mermaid_diagram"):
+                    output.append("")
+                    output.append("## 🔄 Visual Architecture & Flow:")
+                    output.append(report["mermaid_diagram"])
 
                 return "\n".join(output)
             finally:
