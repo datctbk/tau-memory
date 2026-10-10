@@ -2311,9 +2311,12 @@ class MemoryExtension(Extension):
                     output.append("")
 
                 output.append(f"## {5 if report.get('documents_to_update') else 4}. 🧭 Action Checklist for Agent:")
-                output.append("1. **Do NOT search for non-existent keywords across the repository.**")
-                output.append("2. **Open the Request DTO file(s) listed above and add the requested field(s).**")
-                output.append("3. **Open the Service Implementation file(s) listed above and update the method logic to persist or propagate the new field(s).**")
+                output.append("1. **Focus directly on the pinpointed files above without blind global searching.**")
+                if report.get("dtos_to_extend"):
+                    output.append("2. **Open the Request DTO file(s) listed in Section 2 and add the requested field(s).**")
+                else:
+                    output.append("2. **Inspect the Controller/Service method parameters directly to handle any new input parameters.**")
+                output.append("3. **Open the Service Implementation file(s) listed in Section 3 and update the business logic.**")
                 if report.get("documents_to_update"):
                     output.append("4. **Update the Document Specification(s) listed in Section 4 to keep documentation synchronized with code.**")
                     output.append("5. **Verify changes by running existing tests or building the project.**")
